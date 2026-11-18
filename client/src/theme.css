@@ -1,0 +1,91 @@
+/* Web-font slot: uncomment the line below and put your font there. A web-font
+   @import must come before the Tailwind import — an @import placed after any
+   other rule is a build error, and it is reported against a line number in the
+   expanded Tailwind output, far past the end of this file, so the message
+   cannot point you at the mistake. */
+/* @import url('https://fonts.googleapis.com/css2?family=Your+Font:wght@400..700&display=swap'); */
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #fcfcfa;
+  --surface: #ffffff;
+  --text: #1c2430;
+  --dim: #5d6a5f;
+  --border: #dde5dc;
+  --accent: #14532d;
+  --accent-soft: #e7efe9;
+  --record: #d9481f;
+  --record-soft: #f6e3dc;
+  --ok-bg: #e7efe9;
+  --ok-text: #14532d;
+  --ng-bg: #f6e3dc;
+  --ng-text: #9a3412;
+  --cand-liaison: #1d6fb8;
+  --cand-liaison-bg: #e1eefb;
+  --cand-elision: #c0361d;
+  --cand-elision-bg: #fbe7e1;
+  --cand-flap: #177245;
+  --cand-flap-bg: #e2f2e6;
+  --cand-weak: #9a6a12;
+  --radius: 12px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101511;
+    --surface: #1a211c;
+    --text: #eef2ee;
+    --dim: #9db0a2;
+    --border: #2c382e;
+    --accent: #57b877;
+    --accent-soft: #223528;
+    --record: #f0653a;
+    --record-soft: #3d241b;
+    --ok-bg: #223528;
+    --ok-text: #8fd6a4;
+    --ng-bg: #3d241b;
+    --ng-text: #f0a58c;
+    --cand-liaison: #7db8ec;
+    --cand-liaison-bg: #1d3247;
+    --cand-elision: #f0937c;
+    --cand-elision-bg: #452a22;
+    --cand-flap: #8fd6a4;
+    --cand-flap-bg: #223a2a;
+    --cand-weak: #d9b45c;
+  }
+}
+
+/* Phone tap targets: at least 32px tall. */
+@layer base {
+  button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {
+    min-height: 2rem;
+  }
+}
