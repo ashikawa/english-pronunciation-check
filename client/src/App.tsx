@@ -67,11 +67,12 @@ function storeDestinations(destinations: Destination[]) {
 // --- Minimal Web Speech API typings (not in the standard DOM lib) ---
 interface SRAlternative {
   transcript: string;
+  confidence?: number;
 }
 interface SRResultItem {
   isFinal: boolean;
-  0: SRAlternative;
   length: number;
+  [index: number]: SRAlternative;
 }
 interface SRResultEvent {
   resultIndex: number;
@@ -84,11 +85,61 @@ interface SRLike {
   lang: string;
   interimResults: boolean;
   continuous: boolean;
+  maxAlternatives: number;
   onresult: ((event: SRResultEvent) => void) | null;
   onerror: ((event: SRErrorEvent) => void) | null;
   start(): void;
   stop(): void;
   abort?: () => void;
+}
+
+/**
+ * Build full-sentence candidate transcripts from the per-segment
+ * alternatives the browser recognizer returned. Each final segment
+ * contributes its alternatives (index 0 is the recognizer's best guess);
+ * the candidates are the combinations across segments, capped so a long
+ * utterance cannot explode combinatorially. The first candidate is
+ * always the all-best-guess transcript, so when the browser returns
+ * only one alternative per segment this is just `[heard]` and scoring
+ * behaves exactly as before. The server scores every candidate and
+ * keeps the one closest to the target sentence.
+ */
+function buildCandidateTranscripts(segments: string[][]): string[] {
+  const cleaned: string[][] = [];
+  for (const seg of segments) {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of seg) {
+      const t = raw.trim();
+      if (!t) continue;
+      const key = t.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(t);
+    }
+    if (out.length > 0) cleaned.push(out);
+  }
+  if (cleaned.length === 0) return [];
+  const MAX_CANDIDATES = 32;
+  let combos: string[] = [""];
+  for (const seg of cleaned) {
+    const next: string[] = [];
+    for (const prefix of combos) {
+      for (const alt of seg) {
+        next.push(prefix ? `${prefix} ${alt}`.trim() : alt);
+        if (next.length >= MAX_CANDIDATES) break;
+      }
+      if (next.length >= MAX_CANDIDATES) break;
+    }
+    combos = next;
+  }
+  const seenAll = new Set<string>();
+  return combos.filter((c) => {
+    const key = c.toLowerCase();
+    if (seenAll.has(key)) return false;
+    seenAll.add(key);
+    return true;
+  });
 }
 type SRCtor = new () => SRLike;
 
@@ -283,6 +334,10 @@ export function App() {
   // instead of scoring / keeping it.
   const cancelledRef = useRef(false);
   const finalHeardRef = useRef("");
+  // Alternatives per final recognition segment, in arrival order:
+  // finalSegmentsRef.current[i] is the list of transcripts the browser
+  // offered for segment i (index 0 = its best guess).
+  const finalSegmentsRef = useRef<string[][]>([]);
   const timerRef = useRef<number | null>(null);
 
   const target = customText.trim();
@@ -416,7 +471,8 @@ export function App() {
   const currentBest = target ? bestByTarget.get(target) : undefined;
 
   const recordMutation = useMutation({
-    mutationFn: (v: { target: string; heard: string }) => api.recordAttempt(v),
+    mutationFn: (v: { target: string; heard: string; heardCandidates?: string[] }) =>
+      api.recordAttempt(v),
     onSuccess: (data) => {
       if (cancelledRef.current) {
         // Cancelled while scoring: drop the just-saved attempt so the
@@ -665,6 +721,7 @@ export function App() {
     streamRef.current = stream;
     chunksRef.current = [];
     finalHeardRef.current = "";
+    finalSegmentsRef.current = [];
     setLiveHeard("");
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
     setRecordingUrl(null);
@@ -685,16 +742,37 @@ export function App() {
         rec.lang = "en-US";
         rec.interimResults = true;
         rec.continuous = true;
+        // Ask the browser for several alternative transcripts per
+        // segment, not just its single best guess. Browsers that only
+        // ever return one alternative simply ignore this; scoring then
+        // falls back to the single transcript as before. Only the
+        // transcripts (text) are kept — the recording never leaves the
+        // device for scoring.
+        try {
+          rec.maxAlternatives = 5;
+        } catch {
+          // Some implementations expose it read-only; one alternative
+          // is still usable.
+        }
         rec.onresult = (event) => {
           let interim = "";
           for (let k = event.resultIndex; k < event.results.length; k++) {
             const item = event.results[k];
             if (!item) continue;
-            const transcript = item[0].transcript;
+            const best = item[0]?.transcript ?? "";
             if (item.isFinal) {
-              finalHeardRef.current = `${finalHeardRef.current} ${transcript}`.trim();
+              const alts: string[] = [];
+              const altCount =
+                typeof item.length === "number" && item.length > 0 ? item.length : 1;
+              for (let a = 0; a < altCount; a++) {
+                const tr = item[a]?.transcript?.trim();
+                if (tr) alts.push(tr);
+              }
+              if (alts.length === 0 && best.trim()) alts.push(best.trim());
+              if (alts.length > 0) finalSegmentsRef.current.push(alts);
+              finalHeardRef.current = `${finalHeardRef.current} ${best}`.trim();
             } else {
-              interim += transcript;
+              interim += best;
             }
           }
           setLiveHeard(`${finalHeardRef.current} ${interim}`.trim());
@@ -762,6 +840,7 @@ export function App() {
       cancelledRef.current = false;
       chunksRef.current = [];
       finalHeardRef.current = "";
+      finalSegmentsRef.current = [];
       resetAttemptState();
       setInfoMsg("キャンセルしました。録音と採点は中止されました。");
     }
@@ -775,6 +854,7 @@ export function App() {
       cancelledRef.current = false;
       chunksRef.current = [];
       finalHeardRef.current = "";
+      finalSegmentsRef.current = [];
       recordingBlobRef.current = null;
       resetAttemptState();
       setInfoMsg("キャンセルしました。録音と採点は中止されました。");
@@ -798,7 +878,17 @@ export function App() {
       return;
     }
     setPhase("scoring");
-    recordMutation.mutate({ target, heard });
+    // Widen the match: send every candidate transcript the browser
+    // offered (combinations of the per-segment alternatives) and let
+    // the server score against the one closest to the target, so a
+    // word the learner did say is not counted as a mistake just
+    // because the recognizer's first guess missed it.
+    const heardCandidates = buildCandidateTranscripts(finalSegmentsRef.current);
+    recordMutation.mutate({
+      target,
+      heard,
+      heardCandidates: heardCandidates.length > 0 ? heardCandidates : undefined,
+    });
   }
 
   function reuseAttempt(text: string) {

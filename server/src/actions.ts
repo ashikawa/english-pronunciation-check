@@ -2,9 +2,15 @@
 //
 // The client records the user's voice in the browser and transcribes it with
 // the browser's speech recognizer; only the target sentence and the
-// transcript reach the server. `recordAttempt` scores the attempt with a
-// deterministic word alignment, asks the model for one short piece of
-// Japanese feedback (best-effort), and stores the attempt in history.
+// transcript reach the server — the recording itself is never sent for
+// scoring. The recognizer is asked for several alternative transcripts
+// (maxAlternatives); the client forwards those candidates and
+// `recordAttempt` scores the attempt against the candidate closest to
+// the target sentence, with a deterministic word alignment, asks the
+// model for one short piece of Japanese feedback (best-effort), and
+// stores the attempt in history. No phoneme-level or external
+// pronunciation evaluation is used: the match is improved only within
+// the candidates the browser itself returned.
 //
 // Notion export is opt-in per attempt: `saveToNotion` runs only when the
 // user presses the save button on the result screen, and only then does
@@ -156,21 +162,56 @@ return { attempts: rows.map(toAttempt)};
 
 recordAttempt: defineAction({
 description:
-"Scores one pronunciation attempt (target sentence vs recognized transcript), stores it in history, and returns the per-word result.",
+"Scores one pronunciation attempt (target sentence vs the recognized transcript closest to it among the browser's alternative candidates), stores it in history, and returns the per-word result.",
 request: z.object({
 target: z.string().min(1).max(500),
 heard: z.string().max(1000),
+// Alternative transcripts the browser recognizer returned for the
+// same take (full-sentence combinations of its per-segment
+// alternatives, best guess first). Optional: older clients and
+// browsers that return a single alternative omit it, and scoring
+// then uses `heard` alone, exactly as before.
+heardCandidates: z.array(z.string().min(1).max(1000)).max(32).optional(),
 }),
 response: attemptShape,
 async handler(ctx, args): Promise<z.infer<typeof attemptShape>> {
-const { words, score} = diffWords(args.target, args.heard);
+// Pick the candidate closest to the target: score every distinct
+// transcript with the same deterministic alignment and keep the
+// best. The primary transcript is considered first, so a tie keeps
+// the recognizer's own best guess and the result only ever improves
+// on single-candidate scoring — a word the learner said is not
+// counted as a mistake just because the first guess missed it.
+const candidateTexts: string[] = [];
+const seenCandidates = new Set<string>();
+for (const raw of [args.heard, ...(args.heardCandidates ?? [])]) {
+const t = raw.trim();
+if (!t) continue;
+const key = t.toLowerCase();
+if (seenCandidates.has(key)) continue;
+seenCandidates.add(key);
+candidateTexts.push(t);
+if (candidateTexts.length >= 32) break;
+}
+if (candidateTexts.length === 0) candidateTexts.push(args.heard);
+let heard = candidateTexts[0] ?? args.heard;
+let best = diffWords(args.target, heard);
+for (let idx = 1; idx < candidateTexts.length; idx++) {
+const cand = candidateTexts[idx];
+if (!cand) continue;
+const scored = diffWords(args.target, cand);
+if (scored.score > best.score) {
+best = scored;
+heard = cand;
+}
+}
+const { words, score} = best;
 
 // Best-effort model feedback; the deterministic score stands without it.
 let feedback: string | null = null;
 const problems = words.filter((w) => w.status!== "ok");
 try {
 const result = await ctx.inference.complete(
-`Target sentence: "${args.target}"\nRecognized transcript: "${args.heard}"\nScore: ${score}/100\nProblem words: ${
+`Target sentence: "${args.target}"\nRecognized transcript: "${heard}"\nScore: ${score}/100\nProblem words: ${
 problems.length
 ? problems.map((w) => `"${w.word}" heard as ${w.heard? `"${w.heard}"`: "nothing"}`).join(", ")
 : "none"
@@ -191,7 +232,7 @@ const insertedRows = await db
 .insert(schema.attempts)
 .values({
 target: args.target,
-heard: args.heard,
+heard,
 score,
 wordsJson: JSON.stringify(words),
 feedback,
