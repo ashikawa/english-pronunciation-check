@@ -64,6 +64,70 @@ function storeDestinations(destinations: Destination[]) {
   }
 }
 
+// --- Practice text (kept in this device's localStorage) ---
+// The text being practiced is a per-device draft, so it lives in the
+// browser, not the server database. The current input is auto-saved
+// and restored on the next visit; the user can also save texts to a
+// list and call them back later. Both are cleared from the UI.
+
+const PRACTICE_TEXT_KEY = "practice-text-v1";
+const SAVED_TEXTS_KEY = "saved-practice-texts-v1";
+const SAVED_TEXTS_LIMIT = 50;
+
+function loadStoredPracticeText(): string {
+  try {
+    return window.localStorage.getItem(PRACTICE_TEXT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function storePracticeText(text: string) {
+  try {
+    if (text) {
+      window.localStorage.setItem(PRACTICE_TEXT_KEY, text);
+    } else {
+      window.localStorage.removeItem(PRACTICE_TEXT_KEY);
+    }
+  } catch {
+    // Storage unavailable: the text still works for this session.
+  }
+}
+
+function loadStoredSavedTexts(): string[] {
+  try {
+    const raw = window.localStorage.getItem(SAVED_TEXTS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const item of parsed) {
+      if (typeof item !== "string") continue;
+      const t = item.trim();
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+      if (out.length >= SAVED_TEXTS_LIMIT) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function storeSavedTexts(texts: string[]) {
+  try {
+    if (texts.length > 0) {
+      window.localStorage.setItem(SAVED_TEXTS_KEY, JSON.stringify(texts));
+    } else {
+      window.localStorage.removeItem(SAVED_TEXTS_KEY);
+    }
+  } catch {
+    // Storage unavailable: the list still works for this session.
+  }
+}
+
 // --- Minimal Web Speech API typings (not in the standard DOM lib) ---
 interface SRAlternative {
   transcript: string;
@@ -305,7 +369,9 @@ async function blobToBase64(blob: Blob): Promise<string> {
 
 export function App() {
   const queryClient = useQueryClient();
-  const [customText, setCustomText] = useState("");
+  const [customText, setCustomText] = useState<string>(loadStoredPracticeText);
+  const [savedTexts, setSavedTexts] = useState<string[]>(loadStoredSavedTexts);
+  const [confirmClearSaved, setConfirmClearSaved] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
   const [result, setResult] = useState<Attempt | null>(null);
   const [liveHeard, setLiveHeard] = useState("");
@@ -516,6 +582,58 @@ export function App() {
       void queryClient.invalidateQueries({ queryKey: ["attempts"] });
     },
   });
+
+  // --- Practice text persistence (localStorage) ---
+  // Auto-save the current input so it is restored on the next visit,
+  // and persist the saved-texts list the same way.
+  useEffect(() => {
+    storePracticeText(customText);
+  }, [customText]);
+
+  useEffect(() => {
+    storeSavedTexts(savedTexts);
+  }, [savedTexts]);
+
+  const isCurrentTextSaved = target !== "" && savedTexts.includes(target);
+
+  function clearPracticeText() {
+    if (busy) return;
+    setCustomText("");
+    resetAttemptState();
+    setInfoMsg("テキストをクリアしました。");
+  }
+
+  function saveCurrentText() {
+    const t = customText.trim();
+    if (!t) {
+      setError("保存する英文を入力してください。");
+      return;
+    }
+    setError(null);
+    if (savedTexts.includes(t)) {
+      setInfoMsg("この英文はすでに保存されています。");
+      return;
+    }
+    setSavedTexts((prev) => [t, ...prev].slice(0, SAVED_TEXTS_LIMIT));
+    setInfoMsg("英文を保存しました。下の「保存済みの英文」から次回も呼び出せます。");
+  }
+
+  function loadSavedText(text: string) {
+    if (busy) return;
+    setCustomText(text);
+    resetAttemptState();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function deleteSavedText(text: string) {
+    setSavedTexts((prev) => prev.filter((t) => t !== text));
+  }
+
+  function clearAllSavedTexts() {
+    setSavedTexts([]);
+    setConfirmClearSaved(false);
+    setInfoMsg("保存済みの英文をすべて削除しました。");
+  }
 
   // --- Notion export ---
   // The destination list lives in localStorage (see loadStoredDestinations);
@@ -940,8 +1058,103 @@ export function App() {
             style={{ fontFamily: SERIF }}
           />
           <p className="mt-1 text-xs text-[var(--dim)]">
-            外部音源の英文をそのまま入力してください。「お手本を聞く」は端末の読み上げ機能で再生されます。入力すると、音の変化（連結・消失・フラップ・弱形）の候補が下に表示されます。
+            外部音源の英文をそのまま入力してください。「お手本を聞く」は端末の読み上げ機能で再生されます。入力すると、音の変化（連結・消失・フラップ・弱形）の候補が下に表示されます。入力中の英文はこの端末に自動保存され、次回開いたときに復元されます。
           </p>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={saveCurrentText}
+              disabled={busy || !target || isCurrentTextSaved}
+              className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+              aria-label="入力した英文を保存する"
+            >
+              {isCurrentTextSaved ? "保存済み" : "この英文を保存"}
+            </button>
+            <button
+              type="button"
+              onClick={clearPracticeText}
+              disabled={busy || !customText}
+              className="rounded-full border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--dim)] disabled:opacity-40"
+              aria-label="入力した英文をクリアする"
+            >
+              クリア
+            </button>
+            <span className="text-xs text-[var(--dim)]">保存先はこの端末のブラウザです</span>
+          </div>
+
+          {savedTexts.length > 0 && (
+            <div className="mt-4 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg)] px-3 py-3">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold">保存済みの英文</h3>
+                {confirmClearSaved ? (
+                  <span className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={clearAllSavedTexts}
+                      className="rounded-full bg-[var(--record)] px-3 py-1.5 text-xs font-semibold text-white"
+                      aria-label="保存済みの英文をすべて削除する（確認）"
+                    >
+                      本当に全件削除
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmClearSaved(false)}
+                      className="rounded-full border border-[var(--border)] px-3 py-1.5 text-xs"
+                      aria-label="保存済みの英文の全件削除をキャンセル"
+                    >
+                      キャンセル
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmClearSaved(true)}
+                    className="rounded-full border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--dim)]"
+                    aria-label="保存済みの英文をすべて削除"
+                  >
+                    すべて削除
+                  </button>
+                )}
+              </div>
+              <p className="mt-1 text-xs text-[var(--dim)]">
+                タップすると入力欄に呼び出せます。保存はこの端末のみで、最大{SAVED_TEXTS_LIMIT}件です。
+              </p>
+              <ul className="mt-2 space-y-2">
+                {savedTexts.map((text) => (
+                  <li
+                    key={text}
+                    className="flex items-start gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => loadSavedText(text)}
+                      disabled={busy}
+                      className="min-w-0 flex-1 text-left text-base disabled:opacity-40"
+                      style={{ fontFamily: SERIF }}
+                      aria-label={`保存済みの英文「${text}」を入力欄に呼び出す`}
+                    >
+                      {text}
+                      {text === target && (
+                        <span className="ml-2 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 align-middle text-xs font-medium text-[var(--accent)]">
+                          表示中
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteSavedText(text)}
+                      disabled={busy}
+                      className="shrink-0 rounded-full border border-[var(--border)] px-2.5 py-1 text-xs text-[var(--dim)] disabled:opacity-40"
+                      aria-label={`保存済みの英文「${text}」を削除`}
+                    >
+                      削除
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           {target &&
             (candidates.length === 0 ? (
