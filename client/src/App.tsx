@@ -371,6 +371,7 @@ export function App() {
   const queryClient = useQueryClient();
   const [customText, setCustomText] = useState<string>(loadStoredPracticeText);
   const [savedTexts, setSavedTexts] = useState<string[]>(loadStoredSavedTexts);
+  const [savedTextsOpen, setSavedTextsOpen] = useState(false);
   const [confirmClearSaved, setConfirmClearSaved] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
   const [result, setResult] = useState<Attempt | null>(null);
@@ -1075,7 +1076,7 @@ export function App() {
               type="button"
               onClick={clearPracticeText}
               disabled={busy || !customText}
-              className="rounded-full border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--dim)] disabled:opacity-40"
+              className="rounded-full border border-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--accent)] disabled:opacity-40"
               aria-label="入力した英文をクリアする"
             >
               クリア
@@ -1086,8 +1087,32 @@ export function App() {
           {savedTexts.length > 0 && (
             <div className="mt-4 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg)] px-3 py-3">
               <div className="flex items-center justify-between gap-2">
-                <h3 className="text-sm font-semibold">保存済みの英文</h3>
-                {confirmClearSaved ? (
+                <button
+                  type="button"
+                  onClick={() => setSavedTextsOpen((v) => !v)}
+                  aria-expanded={savedTextsOpen}
+                  aria-controls="saved-texts-body"
+                  aria-label={savedTextsOpen ? "保存済みの英文を折り畳む" : "保存済みの英文を表示する"}
+                  className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                >
+                  <span
+                    aria-hidden="true"
+                    className="shrink-0 text-xs text-[var(--dim)]"
+                    style={{
+                      display: "inline-block",
+                      transform: savedTextsOpen ? "rotate(90deg)" : "none",
+                      transition: "transform 0.15s ease",
+                    }}
+                  >
+                    ▶
+                  </span>
+                  <h3 className="text-sm font-semibold">
+                    保存済みの英文
+                    <span className="ml-1.5 font-normal text-[var(--dim)]">（{savedTexts.length}件）</span>
+                  </h3>
+                </button>
+                {savedTextsOpen &&
+                  (confirmClearSaved ? (
                   <span className="flex items-center gap-2">
                     <button
                       type="button"
@@ -1115,12 +1140,14 @@ export function App() {
                   >
                     すべて削除
                   </button>
-                )}
+                ))}
               </div>
-              <p className="mt-1 text-xs text-[var(--dim)]">
-                タップすると入力欄に呼び出せます。保存はこの端末のみで、最大{SAVED_TEXTS_LIMIT}件です。
-              </p>
-              <ul className="mt-2 space-y-2">
+              {savedTextsOpen && (
+                <div id="saved-texts-body">
+                  <p className="mt-1 text-xs text-[var(--dim)]">
+                    タップすると入力欄に呼び出せます。保存はこの端末のみで、最大{SAVED_TEXTS_LIMIT}件です。
+                  </p>
+                  <ul className="mt-2 space-y-2">
                 {savedTexts.map((text) => (
                   <li
                     key={text}
@@ -1150,9 +1177,11 @@ export function App() {
                     >
                       削除
                     </button>
-                  </li>
-                ))}
-              </ul>
+                    </li>
+                  ))}
+                  </ul>
+                </div>
+              )}
             </div>
           )}
 
@@ -1178,35 +1207,8 @@ export function App() {
                 <p className="mt-2 text-lg leading-relaxed" style={{ fontFamily: SERIF }}>
                   {renderAnnotated()}
                 </p>
-                <ul className="mt-2 space-y-1.5">
-                  {candidates.map((c, idx) => {
-                    const status = candidateStatus(c);
-                    return (
-                      <li key={`${c.kind}-${c.tokenIndexes.join("-")}-${idx}`} className="flex flex-wrap items-baseline gap-x-2 text-sm">
-                        <span
-                          className="shrink-0 rounded px-1.5 py-0.5 text-xs font-semibold"
-                          style={{ color: KIND_META[c.kind].color, backgroundColor: KIND_META[c.kind].bg }}
-                        >
-                          {KIND_META[c.kind].label}
-                        </span>
-                        <span style={{ fontFamily: SERIF }}>{c.phrase}</span>
-                        <span className="text-xs text-[var(--dim)]">{c.detail}</span>
-                        {status === "passed" && (
-                          <span className="rounded-full bg-[var(--ok-bg)] px-2 py-0.5 text-xs font-medium text-[var(--ok-text)]">
-                            通じた可能性あり
-                          </span>
-                        )}
-                        {status === "check" && (
-                          <span className="rounded-full bg-[var(--ng-bg)] px-2 py-0.5 text-xs font-medium text-[var(--ng-text)]">
-                            要確認
-                          </span>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
                 <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
-                  候補は綴りからの推定です。実際に音が変化したかまでは判定できません。録音後の「通じた可能性あり」は、候補の単語が認識されたかどうかの目安です。
+                  候補は綴りからの推定です。実際に音が変化したかまでは判定できません。
                 </p>
               </div>
             ))}
