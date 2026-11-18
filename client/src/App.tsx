@@ -128,6 +128,50 @@ function storeSavedTexts(texts: string[]) {
   }
 }
 
+// --- Recognition failure log (kept in this device's localStorage) ---
+// When a take ends with an empty transcript, its diagnostic summary
+// (duration, session counts, mic peak level, error code) is appended
+// here so the failure survives a page reload and can be reported
+// verbatim later. Per-device only, like the other local stores.
+
+const FAILURE_LOG_KEY = "recognition-failure-log-v1";
+const FAILURE_LOG_LIMIT = 20;
+
+type FailureLogEntry = { at: string; summary: string };
+
+function loadStoredFailureLog(): FailureLogEntry[] {
+  try {
+    const raw = window.localStorage.getItem(FAILURE_LOG_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: FailureLogEntry[] = [];
+    for (const item of parsed) {
+      if (typeof item !== "object" || item === null) continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.at === "string" && typeof rec.summary === "string" && rec.summary) {
+        out.push({ at: rec.at, summary: rec.summary });
+      }
+      if (out.length >= FAILURE_LOG_LIMIT) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function storeFailureLog(entries: FailureLogEntry[]) {
+  try {
+    if (entries.length > 0) {
+      window.localStorage.setItem(FAILURE_LOG_KEY, JSON.stringify(entries));
+    } else {
+      window.localStorage.removeItem(FAILURE_LOG_KEY);
+    }
+  } catch {
+    // Storage unavailable: the log still works for this session.
+  }
+}
+
 // --- Minimal Web Speech API typings (not in the standard DOM lib) ---
 interface SRAlternative {
   transcript: string;
@@ -152,6 +196,7 @@ interface SRLike {
   maxAlternatives: number;
   onresult: ((event: SRResultEvent) => void) | null;
   onerror: ((event: SRErrorEvent) => void) | null;
+  onend: (() => void) | null;
   start(): void;
   stop(): void;
   abort?: () => void;
@@ -207,6 +252,38 @@ function buildCandidateTranscripts(segments: string[][]): string[] {
 }
 type SRCtor = new () => SRLike;
 
+/** A promise plus its resolver: signals that recognition has fully
+ *  ended after being asked to stop. */
+function createSettledSignal(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Upper bound on mid-take recognition restarts, so a recognizer that
+ *  ends immediately every time cannot spin in a restart loop. Any
+ *  result resets the budget. */
+const MAX_RECOGNITION_RESTARTS = 30;
+
+/** A recognition session that ends within this window of starting,
+ *  without producing a single result, counts as a failed start rather
+ *  than a healthy session that merely paused. */
+const EARLY_END_MS = 1500;
+
+/** How many failed starts in a row are retried before the take gives
+ *  up on recognition and says why, instead of silently restarting. */
+const MAX_EARLY_FAILURES = 3;
+
+/** Hard cap on waiting for the previous take's recognition session to
+ *  actually end before a new take may start. The wait normally ends
+ *  with the session's own `onend`; the cap exists only so a session
+ *  whose `onend` never arrives cannot wedge recording forever — and
+ *  even then the new session is NOT started over the old one: the
+ *  take is aborted with the reason left on screen. */
+const PREV_SESSION_WAIT_CAP_MS = 20_000;
+
 function getRecognitionCtor(): SRCtor | null {
   const w = window as unknown as {
     SpeechRecognition?: SRCtor;
@@ -215,7 +292,7 @@ function getRecognitionCtor(): SRCtor | null {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }
 
-type Phase = "idle" | "recording" | "scoring" | "done" | "recordedOnly";
+type Phase = "idle" | "starting" | "recording" | "stopping" | "scoring" | "done" | "recordedOnly";
 
 const SERIF = "Georgia, 'Times New Roman', 'Hiragino Mincho ProN', serif";
 
@@ -371,6 +448,8 @@ export function App() {
   const queryClient = useQueryClient();
   const [customText, setCustomText] = useState<string>(loadStoredPracticeText);
   const [savedTexts, setSavedTexts] = useState<string[]>(loadStoredSavedTexts);
+  const [failureLog, setFailureLog] = useState<FailureLogEntry[]>(loadStoredFailureLog);
+  const [failureLogOpen, setFailureLogOpen] = useState(false);
   const [savedTextsOpen, setSavedTextsOpen] = useState(false);
   const [confirmClearSaved, setConfirmClearSaved] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -378,6 +457,28 @@ export function App() {
   const [liveHeard, setLiveHeard] = useState("");
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Latest speech-recognition problem, kept on screen in readable
+  // form (including the browser's own error code) until the next take
+  // starts or one completes cleanly, so a failure can be reported
+  // exactly as it appeared instead of being swallowed. Deliberately
+  // NOT cleared by resetAttemptState: it must survive the cancel /
+  // reset paths that follow the failure it describes.
+  const [recDiag, setRecDiag] = useState<string | null>(null);
+  // True when the last take ended with an empty transcript. The UI
+  // then offers a recognition reset (page reload) next to the error
+  // message: reloading is the only in-page recovery when the
+  // browser's recognizer itself is wedged, and everything the user
+  // typed or saved lives in localStorage / the server history, so a
+  // reload loses nothing.
+  const [emptyRecognition, setEmptyRecognition] = useState(false);
+  // The empty take's diagnostic summary plus a plain-language reading
+  // of it (mic-side vs recognizer-side), rendered INSIDE the error
+  // frame so the whole report is in one place to copy and send.
+  const [emptyDiag, setEmptyDiag] = useState<{ summary: string; note: string | null } | null>(null);
+  // Live mic input level (0..1) while recording, from the analyser
+  // monitor; shown as a small meter so the user can see their voice
+  // is reaching the microphone.
+  const [micLevel, setMicLevel] = useState(0);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -396,6 +497,54 @@ export function App() {
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const recognitionRef = useRef<SRLike | null>(null);
+  // Recognition lifecycle for the current take. A session ends
+  // asynchronously: its final results arrive just before `onend`,
+  // after `stop()` has already returned. `recognitionSettledRef`
+  // resolves only once recognition has been ASKED to stop and the
+  // last session has ended (mid-take restarts do not resolve it);
+  // scoring waits for it so the last words are not lost, and the next
+  // take waits for it before starting a new session — starting while
+  // the old session is still shutting down throws.
+  const recognitionSettledRef = useRef<{
+    promise: Promise<void>;
+    resolve: () => void;
+  } | null>(null);
+  // True while the current take wants recognition running. A session
+  // that ends on its own mid-take (long pause, transient network
+  // drop) is restarted while this is true; stop/cancel set it false.
+  const recognitionActiveRef = useRef(false);
+  // True once recognition hit an error restarting cannot fix
+  // (permission, mic capture): the session is left ended.
+  const recognitionFatalRef = useRef(false);
+  const recognitionRestartsRef = useRef(0);
+  // Consecutive sessions that ended immediately after starting
+  // without a single result. Past the cap the take stops pretending
+  // recognition is running and reports the failure instead.
+  const earlyFailuresRef = useRef(0);
+  // Detail of the last synchronous recognition start() failure, kept
+  // so the on-screen message can name it.
+  const recognitionStartErrorRef = useRef<string | null>(null);
+  // Take-level recognition diagnostics. When a take ends with an
+  // empty transcript and no error code — the browser's recognizer
+  // simply returned nothing — these are the only facts available for
+  // telling a wedged recognizer apart from a quiet room, so the stop
+  // path always renders them into the on-screen diagnostic line.
+  const sessionCountRef = useRef(0);
+  const anyResultRef = useRef(false);
+  const takeStartedAtRef = useRef<number | null>(null);
+  const restartTimerRef = useRef<number | null>(null);
+  // Take lifecycle: "none" → "starting" → "recording" → "stopping".
+  // Guards start/stop/cancel against double operation and lets async
+  // continuations tell whether their take is still the current one.
+  const takeStateRef = useRef<"none" | "starting" | "recording" | "stopping">("none");
+  const takeIdRef = useRef(0);
+  // Set once the current take's recorder-stop handling has run, so a
+  // manually invoked fallback cannot run it a second time.
+  const stopHandledRef = useRef(true);
+  // Last recognition error code for the current take (e.g. "network",
+  // "not-allowed"). Kept so an empty transcript can explain WHY
+  // recognition failed instead of only saying nothing was heard.
+  const recognitionErrorRef = useRef<string | null>(null);
   // Set when the user cancels mid-recording or mid-scoring: the recorder's
   // onstop handler and the scoring mutation check it and discard the take
   // instead of scoring / keeping it.
@@ -406,6 +555,15 @@ export function App() {
   // offered for segment i (index 0 = its best guess).
   const finalSegmentsRef = useRef<string[][]>([]);
   const timerRef = useRef<number | null>(null);
+  // Mic level monitor: an AnalyserNode tapped off the same mic stream
+  // the recorder uses. It measures the input level only — nothing is
+  // recorded or sent anywhere — so an empty-recognition take can be
+  // attributed: a healthy peak means the voice reached the microphone
+  // and the browser's recognizer returned nothing; a near-zero peak
+  // means the voice never reached the mic.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const micMonitorTimerRef = useRef<number | null>(null);
+  const micPeakRef = useRef<number | null>(null);
 
   const target = customText.trim();
 
@@ -556,6 +714,7 @@ export function App() {
         return;
       }
       setResult(data);
+      setRecDiag(null);
       setPhase("done");
       void queryClient.invalidateQueries({ queryKey: ["attempts"] });
     },
@@ -594,6 +753,10 @@ export function App() {
   useEffect(() => {
     storeSavedTexts(savedTexts);
   }, [savedTexts]);
+
+  useEffect(() => {
+    storeFailureLog(failureLog);
+  }, [failureLog]);
 
   const isCurrentTextSaved = target !== "" && savedTexts.includes(target);
 
@@ -785,6 +948,17 @@ export function App() {
   useEffect(() => {
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop());
+      if (micMonitorTimerRef.current !== null) window.clearInterval(micMonitorTimerRef.current);
+      const audioCtx = audioCtxRef.current;
+      audioCtxRef.current = null;
+      if (audioCtx) void audioCtx.close().catch(() => undefined);
+      recognitionActiveRef.current = false;
+      if (restartTimerRef.current !== null) window.clearTimeout(restartTimerRef.current);
+      try {
+        recognitionRef.current?.abort?.();
+      } catch {
+        // already ended
+      }
       if (timerRef.current !== null) window.clearInterval(timerRef.current);
     };
   }, []);
@@ -793,6 +967,8 @@ export function App() {
     setResult(null);
     setLiveHeard("");
     setError(null);
+    setEmptyRecognition(false);
+    setEmptyDiag(null);
     setInfoMsg(null);
     setPhase("idle");
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
@@ -817,9 +993,312 @@ export function App() {
     window.speechSynthesis.speak(utter);
   }
 
+  function stopElapsedTimer() {
+    if (timerRef.current !== null) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }
+
+  function clearRestartTimer() {
+    if (restartTimerRef.current !== null) {
+      window.clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+  }
+
+  /** Start measuring the mic input level for this take. Best-effort:
+   *  if the Web Audio API is unavailable the peak stays null and the
+   *  diagnostics say 計測できず instead of guessing. */
+  function startMicMonitor(stream: MediaStream) {
+    stopMicMonitor();
+    micPeakRef.current = 0;
+    try {
+      const Ctor =
+        window.AudioContext ??
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctor) {
+        micPeakRef.current = null;
+        return;
+      }
+      const ctx = new Ctor();
+      audioCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      const buf = new Uint8Array(analyser.fftSize);
+      micMonitorTimerRef.current = window.setInterval(() => {
+        analyser.getByteTimeDomainData(buf);
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const v = Math.abs((buf[i] ?? 128) - 128) / 128;
+          if (v > peak) peak = v;
+        }
+        if (micPeakRef.current !== null && peak > micPeakRef.current) {
+          micPeakRef.current = peak;
+        }
+        setMicLevel(peak);
+      }, 200);
+      void ctx.resume().catch(() => undefined);
+    } catch {
+      micPeakRef.current = null;
+    }
+  }
+
+  /** Stop the mic level monitor. The peak value is kept in its ref so
+   *  the stop path can still read it after the monitor is gone. */
+  function stopMicMonitor() {
+    if (micMonitorTimerRef.current !== null) {
+      window.clearInterval(micMonitorTimerRef.current);
+      micMonitorTimerRef.current = null;
+    }
+    const ctx = audioCtxRef.current;
+    audioCtxRef.current = null;
+    if (ctx) void ctx.close().catch(() => undefined);
+    setMicLevel(0);
+  }
+
+  /** Discard a cancelled take: throw the audio and transcript away, clear
+   *  the per-take refs, and return to the initial state. Nothing is
+   *  scored and nothing is stored.
+   *
+   *  The recognition settled signal is deliberately KEPT, unlike the
+   *  other refs: `abort()` ends a session asynchronously, so the old
+   *  session may still be shutting down when the UI is already back to
+   *  idle. The next take's `startRecording` awaits this signal before
+   *  starting a new session; discarding it here (as this function used
+   *  to) let the next take call `start()` while the old session was
+   *  still ending, which throws and leaves the take unrecognized. The
+   *  signal resolves from the old session's own `onend` (each session
+   *  captures its take's signal), or immediately in `cancelAttempt`
+   *  when no session is live anymore. `startRecording` waits for that
+   *  real end however long it takes; only past a 20-second hard cap
+   *  does it give up — and then it aborts the new take with the
+   *  reason on screen rather than starting over the old session. */
+  function discardCancelledTake() {
+    cancelledRef.current = false;
+    recognitionActiveRef.current = false;
+    clearRestartTimer();
+    stopMicMonitor();
+    recognitionRef.current = null;
+    recorderRef.current = null;
+    takeStateRef.current = "none";
+    // The take is fully handled here; a late recorder `onstop` for it
+    // must not go on to score anything.
+    stopHandledRef.current = true;
+    chunksRef.current = [];
+    finalHeardRef.current = "";
+    finalSegmentsRef.current = [];
+    recordingBlobRef.current = null;
+    resetAttemptState();
+    setInfoMsg("キャンセルしました。録音と採点は中止されました。");
+  }
+
+  /**
+   * Start one recognition session for the current take and wire its
+   * handlers. Returns false when the session could not be started.
+   *
+   * A session can end on its own mid-take (a long pause, a transient
+   * network drop): `onend` then restarts it while the take is still
+   * recording, so the rest of the take is still heard — the accumulated
+   * transcript lives in refs outside the session, so a restart loses
+   * nothing. Fatal errors (permission, mic capture) are not restarted.
+   * The take's settled signal resolves only once recognition has been
+   * asked to stop AND the last session has ended, which is what the
+   * scoring path waits for.
+   *
+   * A session that ends immediately after starting, without a single
+   * result, is a failed start, not a healthy pause: it is retried a
+   * few times, and then the take gives up on recognition and leaves
+   * the reason (with the error code) on screen, instead of looping
+   * restarts silently while the user believes they are being heard.
+   */
+  function beginRecognition(Ctor: SRCtor, takeId: number): boolean {
+    let rec: SRLike;
+    // This session belongs to one take: it captures that take's settled
+    // signal and resolves only that one when it ends. A late `onend`
+    // from a previous take's session must never release the current
+    // take's scoring wait, and its late results/errors must never leak
+    // into the current take's transcript — the handlers below check
+    // the take id for exactly that.
+    const settledSignal = recognitionSettledRef.current;
+    // Per-session health tracking for the failed-start detection in
+    // `onend`: when this session started, and whether it ever
+    // produced a result.
+    const startedAt = Date.now();
+    let hadResult = false;
+    try {
+      rec = new Ctor();
+      rec.lang = "en-US";
+      rec.interimResults = true;
+      rec.continuous = true;
+      // Ask the browser for several alternative transcripts per
+      // segment, not just its single best guess. Browsers that only
+      // ever return one alternative simply ignore this; scoring then
+      // falls back to the single transcript as before. Only the
+      // transcripts (text) are kept — the recording never leaves the
+      // device for scoring.
+      try {
+        rec.maxAlternatives = 5;
+      } catch {
+        // Some implementations expose it read-only; one alternative
+        // is still usable.
+      }
+      rec.onresult = (event) => {
+        // Late results from a previous take's session (still shutting
+        // down after a cancel) are not this take's words.
+        if (takeIdRef.current !== takeId) return;
+        hadResult = true;
+        anyResultRef.current = true;
+        // A session that is producing results is healthy; allow it a
+        // fresh restart budget if it ends later.
+        recognitionRestartsRef.current = 0;
+        earlyFailuresRef.current = 0;
+        let interim = "";
+        for (let k = event.resultIndex; k < event.results.length; k++) {
+          const item = event.results[k];
+          if (!item) continue;
+          const best = item[0]?.transcript ?? "";
+          if (item.isFinal) {
+            const alts: string[] = [];
+            const altCount =
+              typeof item.length === "number" && item.length > 0 ? item.length : 1;
+            for (let a = 0; a < altCount; a++) {
+              const tr = item[a]?.transcript?.trim();
+              if (tr) alts.push(tr);
+            }
+            if (alts.length === 0 && best.trim()) alts.push(best.trim());
+            if (alts.length > 0) finalSegmentsRef.current.push(alts);
+            finalHeardRef.current = `${finalHeardRef.current} ${best}`.trim();
+          } else {
+            interim += best;
+          }
+        }
+        setLiveHeard(`${finalHeardRef.current} ${interim}`.trim());
+      };
+      rec.onerror = (event) => {
+        // A previous take's session reporting late (e.g. its own
+        // "aborted") must not poison this take's error state.
+        if (takeIdRef.current !== takeId) return;
+        // Remember why recognition failed for this take: if the
+        // transcript ends up empty, the stop path shows this instead
+        // of only the generic "not recognized" message. Recording
+        // itself continues — the audio is a separate path and stays
+        // playable either way.
+        if (event.error && event.error !== "aborted") {
+          recognitionErrorRef.current = event.error;
+          // Keep the failure readable on screen, with the browser's
+          // own error code, so it can be reported as-is.
+          setRecDiag(`音声認識エラー: ${event.error}`);
+          if (
+            event.error === "not-allowed" ||
+            event.error === "service-not-allowed" ||
+            event.error === "audio-capture"
+          ) {
+            // Restarting cannot fix these; let the session end.
+            recognitionFatalRef.current = true;
+          }
+        }
+      };
+      rec.onend = () => {
+        if (recognitionRef.current === rec) recognitionRef.current = null;
+        const inTake =
+          takeStateRef.current === "recording" || takeStateRef.current === "starting";
+        // Failed start: this session died immediately, without a
+        // single result, while the take still wants recognition.
+        // Retry a few times; past the cap, stop looping silently —
+        // mark recognition fatal for this take and leave the reason
+        // (with the error code) on screen. The settled signal is NOT
+        // resolved here: the take is still active, and the stop path
+        // releases the wait when the user ends the take.
+        const diedEarly = !hadResult && Date.now() - startedAt < EARLY_END_MS;
+        if (
+          diedEarly &&
+          recognitionActiveRef.current &&
+          !recognitionFatalRef.current &&
+          inTake &&
+          takeIdRef.current === takeId
+        ) {
+          earlyFailuresRef.current += 1;
+          if (earlyFailuresRef.current >= MAX_EARLY_FAILURES) {
+            recognitionFatalRef.current = true;
+            if (!recognitionErrorRef.current) recognitionErrorRef.current = "early-end";
+            setRecDiag(
+              `音声認識が開始直後に終了する状態が続いています（エラー: ${recognitionErrorRef.current}）。これ以上は自動で再試行しません。`,
+            );
+            return;
+          }
+          restartTimerRef.current = window.setTimeout(() => {
+            restartTimerRef.current = null;
+            if (
+              recognitionActiveRef.current &&
+              !recognitionFatalRef.current &&
+              (takeStateRef.current === "recording" || takeStateRef.current === "starting") &&
+              takeIdRef.current === takeId
+            ) {
+              if (!beginRecognition(Ctor, takeId)) {
+                recognitionFatalRef.current = true;
+                setRecDiag(
+                  `音声認識を再開できませんでした（${recognitionStartErrorRef.current ?? "start failed"}）。`,
+                );
+              }
+            }
+          }, 800);
+          return;
+        }
+        const shouldRestart =
+          recognitionActiveRef.current &&
+          !recognitionFatalRef.current &&
+          takeStateRef.current === "recording" &&
+          takeIdRef.current === takeId &&
+          recognitionRestartsRef.current < MAX_RECOGNITION_RESTARTS;
+        if (shouldRestart) {
+          recognitionRestartsRef.current += 1;
+          restartTimerRef.current = window.setTimeout(() => {
+            restartTimerRef.current = null;
+            if (
+              recognitionActiveRef.current &&
+              takeStateRef.current === "recording" &&
+              takeIdRef.current === takeId
+            ) {
+              if (!beginRecognition(Ctor, takeId)) {
+                recognitionFatalRef.current = true;
+                setRecDiag(
+                  `音声認識を再開できませんでした（${recognitionStartErrorRef.current ?? "start failed"}）。`,
+                );
+              }
+            }
+          }, 300);
+        } else if (!recognitionActiveRef.current) {
+          // Resolve only THIS take's signal (captured when the session
+          // started), never whatever signal the ref holds by now: a
+          // newer take may already have installed its own.
+          settledSignal?.resolve();
+        }
+      };
+      rec.start();
+    } catch (e) {
+      recognitionStartErrorRef.current =
+        e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return false;
+    }
+    recognitionRef.current = rec;
+    sessionCountRef.current += 1;
+    return true;
+  }
+
   async function startRecording() {
+    // Double-start guard: a second call while a take is starting,
+    // recording, or stopping would create competing recorder /
+    // recognition sessions whose refs overwrite each other, leaving
+    // one of them running unwatched.
+    if (takeStateRef.current !== "none") return;
     setError(null);
     setInfoMsg(null);
+    setRecDiag(null);
+    setEmptyRecognition(false);
+    setEmptyDiag(null);
     cancelledRef.current = false;
     setResult(null);
     if (!target) {
@@ -830,21 +1309,119 @@ export function App() {
       setError("このブラウザでは録音が使えません。");
       return;
     }
+    takeStateRef.current = "starting";
+    setPhase("starting");
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch {
+      takeStateRef.current = "none";
+      setPhase("idle");
       setError("マイクの使用が許可されませんでした。ブラウザの設定でマイクを許可してください。");
+      return;
+    }
+    if (takeStateRef.current !== "starting") {
+      // The take was abandoned while waiting for the mic.
+      stream.getTracks().forEach((t) => t.stop());
       return;
     }
     streamRef.current = stream;
     chunksRef.current = [];
     finalHeardRef.current = "";
     finalSegmentsRef.current = [];
+    stopHandledRef.current = false;
     setLiveHeard("");
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
     setRecordingUrl(null);
     recordingBlobRef.current = null;
+
+    // Start recognition BEFORE the recorder, and wait for the previous
+    // take's recognition to fully end first. A SpeechRecognition
+    // session ends asynchronously (its final results and `onend`
+    // arrive after `stop()` returns); starting a new session while the
+    // old one is still shutting down throws InvalidStateError. That
+    // throw used to be swallowed, so a second take could show 録音中
+    // with no live recognition behind it and come back empty.
+    const takeId = takeIdRef.current + 1;
+    takeIdRef.current = takeId;
+    const Ctor = getRecognitionCtor();
+    if (Ctor) {
+      const prevSignal = recognitionSettledRef.current;
+      if (prevSignal) {
+        // Wait until the previous session has ACTUALLY ended: the
+        // signal resolves only from that session's own `onend` (or an
+        // explicit resolve when no session was live anymore). An
+        // earlier version gave up after 2 s and started anyway — but
+        // with a long practice text the aborted session can still be
+        // shutting down well past that, and `start()` over a session
+        // that is still ending throws, leaving the new take with no
+        // live recognition. There is deliberately no "start anyway"
+        // path anymore: past the hard cap the take is aborted with
+        // the reason on screen, and the signal is kept so the next
+        // attempt waits for the same session again.
+        const waitStartedAt = Date.now();
+        let announced = false;
+        let settled = false;
+        while (!settled) {
+          settled = await Promise.race([
+            prevSignal.promise.then(() => true),
+            new Promise<boolean>((r) => window.setTimeout(() => r(false), 250)),
+          ]);
+          if (settled) break;
+          const waited = Date.now() - waitStartedAt;
+          if (!announced && waited >= 1500) {
+            announced = true;
+            setRecDiag("前の音声認識セッションの終了を待っています…（終了するまで録音を開始しません）");
+          }
+          if (waited >= PREV_SESSION_WAIT_CAP_MS) break;
+        }
+        if (!settled) {
+          stream.getTracks().forEach((t) => t.stop());
+          streamRef.current = null;
+          takeStateRef.current = "none";
+          setPhase("idle");
+          setRecDiag(
+            `前の音声認識セッションが${Math.round(PREV_SESSION_WAIT_CAP_MS / 1000)}秒待っても終了しませんでした（終了待ちタイムアウト）。`,
+          );
+          setError("前の音声認識セッションの終了待ちがタイムアウトしました。少し待ってから、もう一度録音してください。");
+          return;
+        }
+        if (recognitionSettledRef.current === prevSignal) {
+          recognitionSettledRef.current = null;
+        }
+        if (announced) setRecDiag(null);
+      }
+      if (takeStateRef.current !== "starting") {
+        stream.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+        return;
+      }
+      recognitionErrorRef.current = null;
+      recognitionFatalRef.current = false;
+      recognitionRestartsRef.current = 0;
+      earlyFailuresRef.current = 0;
+      recognitionStartErrorRef.current = null;
+      sessionCountRef.current = 0;
+      anyResultRef.current = false;
+      recognitionSettledRef.current = createSettledSignal();
+      recognitionActiveRef.current = true;
+      if (!beginRecognition(Ctor, takeId)) {
+        // Recognition could not start at all: do not begin a take the
+        // user believes is being transcribed. Release the mic and say
+        // so instead of silently recording without recognition.
+        recognitionActiveRef.current = false;
+        recognitionSettledRef.current = null;
+        stream.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+        takeStateRef.current = "none";
+        setPhase("idle");
+        setRecDiag(
+          `音声認識の開始に失敗しました（${recognitionStartErrorRef.current ?? "start failed"}）。`,
+        );
+        setError("音声認識を開始できませんでした。少し待ってから、もう一度録音してください。");
+        return;
+      }
+    }
 
     const recorder = new MediaRecorder(stream);
     recorder.ondataavailable = (e) => {
@@ -852,85 +1429,56 @@ export function App() {
     };
     recorder.onstop = handleRecorderStop;
     recorderRef.current = recorder;
+    startMicMonitor(stream);
     recorder.start();
+    takeStartedAtRef.current = Date.now();
 
-    const Ctor = getRecognitionCtor();
-    if (Ctor) {
-      try {
-        const rec = new Ctor();
-        rec.lang = "en-US";
-        rec.interimResults = true;
-        rec.continuous = true;
-        // Ask the browser for several alternative transcripts per
-        // segment, not just its single best guess. Browsers that only
-        // ever return one alternative simply ignore this; scoring then
-        // falls back to the single transcript as before. Only the
-        // transcripts (text) are kept — the recording never leaves the
-        // device for scoring.
-        try {
-          rec.maxAlternatives = 5;
-        } catch {
-          // Some implementations expose it read-only; one alternative
-          // is still usable.
-        }
-        rec.onresult = (event) => {
-          let interim = "";
-          for (let k = event.resultIndex; k < event.results.length; k++) {
-            const item = event.results[k];
-            if (!item) continue;
-            const best = item[0]?.transcript ?? "";
-            if (item.isFinal) {
-              const alts: string[] = [];
-              const altCount =
-                typeof item.length === "number" && item.length > 0 ? item.length : 1;
-              for (let a = 0; a < altCount; a++) {
-                const tr = item[a]?.transcript?.trim();
-                if (tr) alts.push(tr);
-              }
-              if (alts.length === 0 && best.trim()) alts.push(best.trim());
-              if (alts.length > 0) finalSegmentsRef.current.push(alts);
-              finalHeardRef.current = `${finalHeardRef.current} ${best}`.trim();
-            } else {
-              interim += best;
-            }
-          }
-          setLiveHeard(`${finalHeardRef.current} ${interim}`.trim());
-        };
-        rec.onerror = () => {
-          // Keep recording audio even if recognition hiccups; the empty
-          // transcript path below explains what happened.
-        };
-        rec.start();
-        recognitionRef.current = rec;
-      } catch {
-        recognitionRef.current = null;
-      }
-    }
-
+    takeStateRef.current = "recording";
     setElapsed(0);
     setPhase("recording");
     timerRef.current = window.setInterval(() => setElapsed((s) => s + 1), 1000);
   }
 
   function stopRecording() {
-    if (timerRef.current !== null) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
+    if (takeStateRef.current !== "recording") return;
+    takeStateRef.current = "stopping";
+    setPhase("stopping");
+    stopElapsedTimer();
+    // Ask recognition to stop, and make sure a pending mid-take
+    // restart cannot fire after this point.
+    recognitionActiveRef.current = false;
+    clearRestartTimer();
     try {
       recognitionRef.current?.stop();
     } catch {
-      // already stopped
+      // already ended
     }
-    recognitionRef.current = null;
-    recorderRef.current?.stop();
+    if (!recognitionRef.current) {
+      // No live session (it already ended, or died fatally): nothing
+      // will fire `onend`, so release the scoring path's wait now.
+      recognitionSettledRef.current?.resolve();
+    }
+    const recorder = recorderRef.current;
+    if (!recorder) {
+      void handleRecorderStop();
+      return;
+    }
+    try {
+      recorder.stop();
+    } catch {
+      // Already inactive: `onstop` will not fire, so finish here.
+      void handleRecorderStop();
+    }
   }
 
   /** Cancel a take in progress: stops the mic and recognizer and discards
    *  the recording without scoring it. Also works while scoring is in
-   *  flight — the mutation's callbacks then drop the attempt. */
+   *  flight — the mutation's callbacks then drop the attempt — and in
+   *  the brief window after 停止 was pressed, while the stop is still
+   *  settling: the stop path re-checks the cancel flag after its wait
+   *  and discards the take instead of scoring it. */
   function cancelAttempt() {
-    if (phase !== "recording" && phase !== "scoring") return;
+    if (phase !== "recording" && phase !== "stopping" && phase !== "scoring") return;
     cancelledRef.current = true;
     if (phase === "scoring") {
       // The recorder already stopped; the scoring callbacks discard the
@@ -938,51 +1486,87 @@ export function App() {
       setInfoMsg("キャンセルしています…");
       return;
     }
-    if (timerRef.current !== null) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
+    stopElapsedTimer();
+    recognitionActiveRef.current = false;
+    clearRestartTimer();
     const rec = recognitionRef.current;
-    recognitionRef.current = null;
     try {
       if (rec?.abort) rec.abort();
       else rec?.stop();
     } catch {
-      // already stopped
+      // already ended
+    }
+    if (!recognitionRef.current) {
+      recognitionSettledRef.current?.resolve();
+    }
+    if (takeStateRef.current === "stopping") {
+      // handleRecorderStop is already in flight (the user pressed 停止
+      // first); it re-checks cancelledRef after its recognition wait
+      // and discards the take, so there is nothing more to stop here.
+      setInfoMsg("キャンセルしています…");
+      return;
+    }
+    takeStateRef.current = "stopping";
+    const recorder = recorderRef.current;
+    if (!recorder) {
+      discardCancelledTake();
+      return;
     }
     try {
-      recorderRef.current?.stop();
+      recorder.stop();
     } catch {
-      // already inactive; nothing will fire onstop, so clean up here
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-      cancelledRef.current = false;
-      chunksRef.current = [];
-      finalHeardRef.current = "";
-      finalSegmentsRef.current = [];
-      resetAttemptState();
-      setInfoMsg("キャンセルしました。録音と採点は中止されました。");
+      // Already inactive: nothing will fire onstop, so clean up here.
+      discardCancelledTake();
     }
   }
 
-  function handleRecorderStop() {
+  async function handleRecorderStop() {
+    if (stopHandledRef.current) return;
+    stopHandledRef.current = true;
+    stopMicMonitor();
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    let settleTimedOut = false;
+    if (!cancelledRef.current && recognitionSettledRef.current) {
+      // The recognizer delivers its final results asynchronously, just
+      // before `onend`; this recorder callback can fire first. Wait
+      // for recognition to settle (bounded) so the last words are in
+      // finalHeardRef before scoring — otherwise a take could be
+      // scored from an empty or truncated transcript.
+      const signal = recognitionSettledRef.current;
+      let settled = false;
+      await Promise.race([
+        signal.promise.then(() => {
+          settled = true;
+        }),
+        new Promise<void>((r) => window.setTimeout(r, 3000)),
+      ]);
+      if (settled) {
+        // This take's signal has done its job and can be dropped. On
+        // timeout it is KEPT instead: the session may still be
+        // shutting down, and the next take must wait for its real end
+        // before starting (the same rule the cancel path follows).
+        if (recognitionSettledRef.current === signal) {
+          recognitionSettledRef.current = null;
+        }
+      } else {
+        settleTimedOut = true;
+        setRecDiag(
+          "音声認識の終了待ちがタイムアウトしました（3秒）。最後の単語が認識結果に反映されていない可能性があります。",
+        );
+      }
+    }
+    const mimeType = recorderRef.current?.mimeType || "audio/webm";
+    recognitionRef.current = null;
+    recorderRef.current = null;
     if (cancelledRef.current) {
-      // Cancelled take: throw the audio and transcript away, no scoring.
-      cancelledRef.current = false;
-      chunksRef.current = [];
-      finalHeardRef.current = "";
-      finalSegmentsRef.current = [];
-      recordingBlobRef.current = null;
-      resetAttemptState();
-      setInfoMsg("キャンセルしました。録音と採点は中止されました。");
+      // Cancelled — including a cancel pressed during the wait above:
+      // throw the audio and transcript away, no scoring, no history.
+      discardCancelledTake();
       return;
     }
-    const recorder = recorderRef.current;
-    const blob = new Blob(chunksRef.current, {
-      type: recorder?.mimeType || "audio/webm",
-    });
+    takeStateRef.current = "none";
+    const blob = new Blob(chunksRef.current, { type: mimeType });
     recordingBlobRef.current = blob.size > 0 ? blob : null;
     if (blob.size > 0) setRecordingUrl(URL.createObjectURL(blob));
 
@@ -992,7 +1576,55 @@ export function App() {
       return;
     }
     if (!heard) {
-      setError("音声が認識できませんでした。静かな場所で、もう少し大きな声で読んでみてください。");
+      setEmptyRecognition(true);
+      // An empty take must ALWAYS leave its facts on screen, even
+      // when the recognizer ended silently with no error code at
+      // all — that silent case is exactly the one that used to show
+      // only the generic message, leaving nothing to report. The
+      // summary states what the take actually did: how long it ran,
+      // how many recognition sessions started, whether any of them
+      // ever produced a result, which error code (if any) the
+      // browser reported, and the peak mic input level measured
+      // during the take. The peak is what separates the two
+      // remaining suspects: a healthy peak means the voice reached
+      // the microphone and the browser's recognizer returned
+      // nothing; a near-zero peak means the voice never arrived.
+      const takeSecs =
+        takeStartedAtRef.current !== null
+          ? Math.max(0, Math.round((Date.now() - takeStartedAtRef.current) / 1000))
+          : null;
+      const micPeak = micPeakRef.current;
+      const summary = `認識結果が空でした（録音時間: ${takeSecs !== null ? `約${takeSecs}秒` : "不明"} / 認識セッション開始: ${sessionCountRef.current}回 / 再起動: ${recognitionRestartsRef.current}回 / 開始直後の終了: ${earlyFailuresRef.current}回 / 結果イベント: ${anyResultRef.current ? "あり" : "なし"} / 確定した文: ${finalSegmentsRef.current.length}件 / マイク音量ピーク: ${micPeak !== null ? `約${Math.round(micPeak * 100)}%` : "計測できず"} / エラーコード: ${recognitionErrorRef.current ?? "なし"}${settleTimedOut ? " / 終了待ち: タイムアウト（3秒）" : ""}）`;
+      setRecDiag(summary);
+      // A plain-language reading of the peak, shown inside the error
+      // frame together with the summary so the whole report is in
+      // one place. Worded as a possibility, not a verdict: the peak
+      // is measured on the recorder's stream, which is strong but
+      // not absolute evidence about the recognizer's own input.
+      const note =
+        micPeak === null
+          ? null
+          : micPeak < 0.03
+            ? "マイク音量ピークがほぼゼロでした。声がマイクに届いていなかった可能性があります（マイクの接続・選択・ミュートを確認してください）。"
+            : "マイクには声が届いていました。ブラウザ側の音声認識サービスが結果を返さなかった可能性が高いです。「認識をリセット（再読み込み）」を試してください。";
+      setEmptyDiag({ summary, note });
+      // Persist the failure so it survives the reload the reset
+      // button performs, and can be reported verbatim afterwards.
+      setFailureLog((prev) =>
+        [{ at: new Date().toISOString(), summary }, ...prev].slice(0, FAILURE_LOG_LIMIT),
+      );
+      const recError = recognitionErrorRef.current;
+      if (recError === "not-allowed" || recError === "service-not-allowed") {
+        setError("音声認識の使用が許可されませんでした。ブラウザの設定で音声認識（マイク）の許可を確認してください。");
+      } else if (recError === "audio-capture") {
+        setError("マイクから音声を取得できませんでした。マイクの接続を確認してもう一度お試しください。");
+      } else if (recError === "early-end") {
+        setError("音声認識が開始直後に終了してしまい、認識できませんでした。ネットワーク接続を確認してもう一度お試しください。");
+      } else if (recError === "network") {
+        setError("音声認識の通信に失敗しました。ネットワーク接続を確認してもう一度お試しください。");
+      } else {
+        setError("音声が認識できませんでした。静かな場所で、もう少し大きな声で読んでみてください。");
+      }
       setPhase("idle");
       return;
     }
@@ -1017,7 +1649,8 @@ export function App() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  const busy = phase === "recording" || phase === "scoring";
+  const busy =
+    phase === "recording" || phase === "scoring" || phase === "starting" || phase === "stopping";
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
@@ -1223,17 +1856,7 @@ export function App() {
             >
               ▶ お手本を聞く
             </button>
-            {phase !== "recording" ? (
-              <button
-                type="button"
-                onClick={() => void startRecording()}
-                disabled={phase === "scoring"}
-                className="rounded-full bg-[var(--record)] px-6 py-3 text-base font-semibold text-white disabled:opacity-40"
-                aria-label="録音を開始"
-              >
-                ● 録音する
-              </button>
-            ) : (
+            {phase === "recording" ? (
               <>
                 <button
                   type="button"
@@ -1252,6 +1875,35 @@ export function App() {
                   ✕ キャンセル
                 </button>
               </>
+            ) : phase === "stopping" ? (
+              <>
+                <button
+                  type="button"
+                  disabled
+                  className="rounded-full bg-[var(--record)] px-6 py-3 text-base font-semibold text-white opacity-40"
+                  aria-label="録音を停止しています"
+                >
+                  ■ 停止中…
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelAttempt}
+                  className="rounded-full border border-[var(--border)] px-5 py-3 text-base font-medium text-[var(--dim)]"
+                  aria-label="録音をキャンセルして採点を中止"
+                >
+                  ✕ キャンセル
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void startRecording()}
+                disabled={phase === "scoring" || phase === "starting"}
+                className="rounded-full bg-[var(--record)] px-6 py-3 text-base font-semibold text-white disabled:opacity-40"
+                aria-label="録音を開始"
+              >
+                {phase === "starting" ? "開始中…" : "● 録音する"}
+              </button>
             )}
           </div>
 
@@ -1261,12 +1913,32 @@ export function App() {
                 <span className="inline-block h-2.5 w-2.5 animate-pulse rounded-full bg-[var(--record)]" />
                 録音中… 文を読んでください
               </p>
+              <div className="mt-2 flex items-center gap-2">
+                <span className="shrink-0 text-xs text-[var(--dim)]">マイク音量</span>
+                <div
+                  className="h-2 flex-1 overflow-hidden rounded-full bg-[var(--border)]"
+                  role="meter"
+                  aria-label="マイク入力音量"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(micLevel * 100)}
+                >
+                  <div
+                    className="h-full rounded-full bg-[var(--accent)]"
+                    style={{ width: `${Math.round(micLevel * 100)}%`, transition: "width 0.15s linear" }}
+                  />
+                </div>
+              </div>
               {liveHeard && (
                 <p className="mt-1 text-sm text-[var(--dim)]" style={{ fontFamily: SERIF }}>
                   {liveHeard}
                 </p>
               )}
             </div>
+          )}
+
+          {phase === "stopping" && (
+            <p className="mt-4 text-sm text-[var(--dim)]">停止しています…</p>
           )}
 
           {phase === "scoring" && (
@@ -1290,9 +1962,108 @@ export function App() {
           )}
 
           {error && (
-            <p role="alert" className="mt-4 rounded-[var(--radius)] bg-[var(--record-soft)] px-3 py-2 text-sm text-[var(--ng-text)]">
-              {error}
+            <div className="mt-4 rounded-[var(--radius)] bg-[var(--record-soft)] px-3 py-2">
+              <p role="alert" className="text-sm leading-relaxed text-[var(--ng-text)]">
+                {error}
+              </p>
+              {emptyRecognition && emptyDiag && (
+                <div className="mt-2 text-sm leading-relaxed text-[var(--ng-text)]">
+                  <p>音声認識の状態: {emptyDiag.summary}</p>
+                  {emptyDiag.note && <p className="mt-1">{emptyDiag.note}</p>}
+                </div>
+              )}
+              {emptyRecognition && (
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => window.location.reload()}
+                    className="rounded-full border border-[var(--ng-text)] px-4 py-1.5 text-sm font-medium text-[var(--ng-text)]"
+                    aria-label="ページを再読み込みして音声認識をリセット"
+                  >
+                    認識をリセット（再読み込み）
+                  </button>
+                  <span className="text-xs leading-relaxed text-[var(--ng-text)]">
+                    再読み込みしても、入力中の英文・保存済みの英文・練習履歴は消えません。
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {recDiag && (
+            <p
+              role="status"
+              className="mt-4 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm leading-relaxed text-[var(--dim)]"
+            >
+              音声認識の状態: {recDiag}
             </p>
+          )}
+
+          {failureLog.length > 0 && (
+            <div className="mt-4 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg)] px-3 py-3">
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => setFailureLogOpen((v) => !v)}
+                  aria-expanded={failureLogOpen}
+                  aria-controls="failure-log-body"
+                  aria-label={failureLogOpen ? "音声認識の失敗ログを折り畳む" : "音声認識の失敗ログを表示する"}
+                  className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                >
+                  <span
+                    aria-hidden="true"
+                    className="shrink-0 text-xs text-[var(--dim)]"
+                    style={{
+                      display: "inline-block",
+                      transform: failureLogOpen ? "rotate(90deg)" : "none",
+                      transition: "transform 0.15s ease",
+                    }}
+                  >
+                    ▶
+                  </span>
+                  <h3 className="text-sm font-semibold">
+                    音声認識の失敗ログ
+                    <span className="ml-1.5 font-normal text-[var(--dim)]">（{failureLog.length}件）</span>
+                  </h3>
+                </button>
+                {failureLogOpen && (
+                  <button
+                    type="button"
+                    onClick={() => setFailureLog([])}
+                    className="shrink-0 rounded-full border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--dim)]"
+                    aria-label="音声認識の失敗ログを消去"
+                  >
+                    ログを消去
+                  </button>
+                )}
+              </div>
+              {failureLogOpen && (
+                <div id="failure-log-body">
+                  <p className="mt-1 text-xs leading-relaxed text-[var(--dim)]">
+                    認識結果が空で終わった回の診断です。再読み込みしても消えません。失敗したときは、この文言をそのまま報告してください。保存はこの端末のみで、最大{FAILURE_LOG_LIMIT}件です。
+                  </p>
+                  <ul className="mt-2 space-y-2">
+                    {failureLog.map((entry, idx) => (
+                      <li
+                        key={`${entry.at}-${idx}`}
+                        className="rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm leading-relaxed"
+                      >
+                        <span className="block text-xs text-[var(--dim)]">
+                          {new Date(entry.at).toLocaleString("ja-JP", {
+                            month: "numeric",
+                            day: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            second: "2-digit",
+                          })}
+                        </span>
+                        {entry.summary}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
           )}
 
           {phase === "recordedOnly" && (
