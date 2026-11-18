@@ -1,9 +1,15 @@
-import { spaceQueryClient } from "@hatch/space-sdk/client";
+import { setFailureNoticeText, spaceQueryClient } from "@hatch/space-sdk/client";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import "./theme.css";
+
+// Mutations without their own error UI (history delete / clear) surface
+// failures as a bottom notice; word it in the interface's language.
+setFailureNoticeText(
+  () => "操作に失敗しました。通信状態を確認してもう一度お試しください。",
+);
 
 const rootEl = document.querySelector<HTMLElement>("[data-generated-space-root]");
 if (!rootEl) {

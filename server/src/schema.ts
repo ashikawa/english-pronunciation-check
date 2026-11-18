@@ -22,16 +22,6 @@ export const attempts = sqliteTable("attempts", {
     .$defaultFn(() => new Date()),
 });
 
-// Notion pages the user has picked (via search) as save destinations.
-// Cached so the destination picker works without a Notion round-trip on
-// every open; refreshed on demand through the search action.
-export const notionDestinations = sqliteTable("notion_destinations", {
-  pageId: text("page_id").primaryKey(),
-  title: text("title").notNull(),
-  url: text("url").notNull(),
-  path: text("path"),
-  isDefault: integer("is_default").notNull().default(0),
-  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-    .notNull()
-    .$defaultFn(() => new Date()),
-});
+// Note: the Notion save-destination list is intentionally NOT a table.
+// It is a per-device picker convenience, so the client keeps it in
+// localStorage; the server only proxies Notion searches on demand.

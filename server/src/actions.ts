@@ -11,10 +11,15 @@
 // the recording (sent as base64 in that one request) leave the device.
 // The actual Notion calls live in privileged handlers (server/src/
 // privileged.ts) because they need the host's notion-cli.
+//
+// The save-destination list is NOT stored server-side: it is a
+// per-device picker convenience, so the client keeps it in
+// localStorage. `searchNotionPages` only proxies one Notion search and
+// returns the matches; the client merges them into its local list.
 
-import { defineAction, z, type ActionsModule, type Ctx} from "@hatch/space-sdk";
-import { PrivilegedContracts} from "@space/privileged";
-import { asc, desc, eq} from "drizzle-orm";
+import { defineAction, z, type ActionsModule } from "@hatch/space-sdk";
+import { PrivilegedContracts } from "@space/privileged";
+import { desc, eq } from "drizzle-orm";
 import * as schema from "./schema";
 
 const wordResult = z.object({
@@ -118,34 +123,18 @@ return { words, score: Math.round((okCount / t.length) * 100)};
 
 const feedbackSchema = z.object({ feedback_ja: z.string()});
 
-// --- Notion destinations ---
+// --- Notion destination search ---
+// The destination list itself lives in the client's localStorage; this
+// action only proxies one Notion search so the picker can find pages.
 
-const destinationShape = z.object({
+const notionPageShape = z.object({
 pageId: z.string(),
 title: z.string(),
 url: z.string(),
 path: z.string().nullable(),
-isDefault: z.boolean(),
 });
 
-type Destination = z.infer<typeof destinationShape>;
-
-async function loadDestinations(ctx: Ctx): Promise<Destination[]> {
-const db = ctx.db<typeof schema>();
-const rows = await db
-.select()
-.from(schema.notionDestinations)
-.orderBy(desc(schema.notionDestinations.isDefault), asc(schema.notionDestinations.title));
-return rows.map((r) => ({
-pageId: r.pageId,
-title: r.title,
-url: r.url,
-path: r.path,
-isDefault: r.isDefault === 1,
-}));
-}
-
-const destinationsResponse = z.object({ destinations: z.array(destinationShape)});
+const notionPagesResponse = z.object({ pages: z.array(notionPageShape)});
 
 export const Actions = {
 listAttempts: defineAction({
@@ -239,69 +228,21 @@ return { ok: true};
 },
 }),
 
-listNotionDestinations: defineAction({
-description: "Lists the cached Notion pages the user can pick as a save destination.",
-request: z.object({}),
-response: destinationsResponse,
-async handler(ctx): Promise<z.infer<typeof destinationsResponse>> {
-return { destinations: await loadDestinations(ctx)};
-},
-}),
-
-searchNotionDestinations: defineAction({
+searchNotionPages: defineAction({
 description:
-"Searches the user's Notion workspace for pages matching a query, caches them as save destinations, and returns the cached destination list.",
+"Searches the user's Notion workspace for pages matching a query and returns the matches. Nothing is stored server-side; the client merges the results into its localStorage destination list.",
 request: z.object({ query: z.string().min(1).max(100)}),
-response: destinationsResponse,
+response: notionPagesResponse,
 privileged: [PrivilegedContracts.notionSearch],
-async handler(ctx, args): Promise<z.infer<typeof destinationsResponse>> {
+async handler(ctx, args): Promise<z.infer<typeof notionPagesResponse>> {
 const { results} = await ctx.executePrivileged(PrivilegedContracts.notionSearch, {
 query: args.query,
 });
-const db = ctx.db<typeof schema>();
-const pages = results.filter((r) => r.type === "page");
-if (pages.length > 0) {
-const existing = await db.select().from(schema.notionDestinations);
-const hasDefault = existing.some((r) => r.isDefault === 1);
-for (const p of pages) {
-// The TED page (the user's chosen home for these results) becomes
-// the default the first time it is seen, until the user picks
-// another default.
-const makeDefault =!hasDefault && p.title === "TED";
-await db
-.insert(schema.notionDestinations)
-.values({
-pageId: p.id,
-title: p.title,
-url: p.url,
-path: p.path,
-isDefault: makeDefault? 1: 0,
-updatedAt: new Date(),
-})
-.onConflictDoUpdate({
-target: schema.notionDestinations.pageId,
-set: { title: p.title, url: p.url, path: p.path, updatedAt: new Date()},
-});
-}
-}
-ctx.invalidateQueries();
-return { destinations: await loadDestinations(ctx)};
-},
-}),
-
-setDefaultNotionDestination: defineAction({
-description: "Marks one cached Notion page as the default save destination.",
-request: z.object({ pageId: z.string().min(1).max(64)}),
-response: destinationsResponse,
-async handler(ctx, args): Promise<z.infer<typeof destinationsResponse>> {
-const db = ctx.db<typeof schema>();
-await db.update(schema.notionDestinations).set({ isDefault: 0});
-await db
-.update(schema.notionDestinations)
-.set({ isDefault: 1})
-.where(eq(schema.notionDestinations.pageId, args.pageId));
-ctx.invalidateQueries();
-return { destinations: await loadDestinations(ctx)};
+return {
+pages: results
+.filter((r) => r.type === "page")
+.map((r) => ({ pageId: r.id, title: r.title, url: r.url, path: r.path})),
+};
 },
 }),
 

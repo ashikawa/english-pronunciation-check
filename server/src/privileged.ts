@@ -16,9 +16,9 @@
 // fetch); it is never returned to the action layer or the client.
 
 import {
-  definePrivilegedContracts,
-  definePrivilegedHandlers,
-  z,
+definePrivilegedContracts,
+definePrivilegedHandlers,
+z,
 } from "@hatch/space-sdk";
 
 export const PrivilegedContracts = definePrivilegedContracts({

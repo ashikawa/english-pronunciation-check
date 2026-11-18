@@ -1,9 +1,68 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
+import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
+import type { Actions } from "../../server/src/actions";
 import { api, type ApiResponse } from "./api";
 
+const FIELDS = actionFields<typeof Actions>();
+
 type Attempt = ApiResponse<typeof api, "recordAttempt">;
+
+// --- Notion save destinations (kept in this device's localStorage) ---
+// The destination list is a per-device picker convenience, so it lives
+// in the browser, not the server database. Searching still goes through
+// the server (it needs the Notion connection); the results are merged
+// into the local list here.
+
+type Destination = {
+  pageId: string;
+  title: string;
+  url: string;
+  path: string | null;
+  isDefault: boolean;
+};
+
+const DEST_STORAGE_KEY = "notion-destinations-v1";
+
+function loadStoredDestinations(): Destination[] {
+  try {
+    const raw = window.localStorage.getItem(DEST_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: Destination[] = [];
+    for (const item of parsed) {
+      if (typeof item !== "object" || item === null) continue;
+      const rec = item as Record<string, unknown>;
+      if (
+        typeof rec.pageId === "string" &&
+        rec.pageId !== "" &&
+        typeof rec.title === "string" &&
+        typeof rec.url === "string"
+      ) {
+        out.push({
+          pageId: rec.pageId,
+          title: rec.title,
+          url: rec.url,
+          path: typeof rec.path === "string" ? rec.path : null,
+          isDefault: rec.isDefault === true,
+        });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function storeDestinations(destinations: Destination[]) {
+  try {
+    window.localStorage.setItem(DEST_STORAGE_KEY, JSON.stringify(destinations));
+  } catch {
+    // Storage full or unavailable: the picker still works for this session.
+  }
+}
 
 // --- Minimal Web Speech API typings (not in the standard DOM lib) ---
 interface SRAlternative {
@@ -207,14 +266,15 @@ export function App() {
   const [recognitionSupported] = useState(() => getRecognitionCtor() !== null);
   // Notion export (opt-in, per result)
   const [wantNotion, setWantNotion] = useState(false);
+  const [destinations, setDestinations] = useState<Destination[]>(loadStoredDestinations);
   const [selectedDest, setSelectedDest] = useState("");
   const [destQuery, setDestQuery] = useState("");
+  const [destQueryError, setDestQueryError] = useState<string | null>(null);
   const [notionMsg, setNotionMsg] = useState<string | null>(null);
   const [historyNotionMsg, setHistoryNotionMsg] = useState<string | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingBlobRef = useRef<Blob | null>(null);
-  const autoDestSearchRef = useRef(false);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const recognitionRef = useRef<SRLike | null>(null);
@@ -402,33 +462,49 @@ export function App() {
   });
 
   // --- Notion export ---
-  const destinationsQuery = useQuery({
-    queryKey: ["notion-destinations"],
-    queryFn: () => api.listNotionDestinations({}),
-  });
-  const destinations = destinationsQuery.data?.destinations ?? [];
+  // The destination list lives in localStorage (see loadStoredDestinations);
+  // every change is written back so the picker survives reloads on this
+  // device. Searching proxies through the server but stores nothing there.
+  useEffect(() => {
+    storeDestinations(destinations);
+  }, [destinations]);
+
   const defaultDest = destinations.find((d) => d.isDefault) ?? destinations[0];
   const effectiveDestId = selectedDest || defaultDest?.pageId || "__draft__";
 
   const searchDestMutation = useMutation({
-    mutationFn: (q: string) => api.searchNotionDestinations({ query: q }),
+    mutationFn: async (q: string) => await api.searchNotionPages({ query: q }),
     onSuccess: (data) => {
-      queryClient.setQueryData(["notion-destinations"], data);
-      if (data.destinations.length === 0) {
+      if (data.pages.length === 0) {
         setNotionMsg("保存先の候補が見つかりませんでした。別の言葉で検索してください。");
+        return;
       }
+      setDestinations((prev) => {
+        const byId = new Map(prev.map((d) => [d.pageId, d]));
+        let hasDefault = prev.some((d) => d.isDefault);
+        for (const p of data.pages) {
+          const existing = byId.get(p.pageId);
+          if (existing) {
+            byId.set(p.pageId, { ...existing, title: p.title, url: p.url, path: p.path });
+          } else {
+            // The first page added while no default exists becomes the
+            // default, until the user picks another one.
+            const makeDefault = !hasDefault;
+            if (makeDefault) hasDefault = true;
+            byId.set(p.pageId, { ...p, isDefault: makeDefault });
+          }
+        }
+        return [...byId.values()];
+      });
     },
     onError: () => {
       setNotionMsg("保存先を検索できませんでした。Notionの接続状態を確認してください。");
     },
   });
 
-  const setDefaultDestMutation = useMutation({
-    mutationFn: (pageId: string) => api.setDefaultNotionDestination({ pageId }),
-    onSuccess: (data) => {
-      queryClient.setQueryData(["notion-destinations"], data);
-    },
-  });
+  function setDefaultDestination(pageId: string) {
+    setDestinations((prev) => prev.map((d) => ({ ...d, isDefault: d.pageId === pageId })));
+  }
 
   type NotionSaveVars = {
     attemptId: number;
@@ -471,22 +547,6 @@ export function App() {
       else setHistoryNotionMsg("Notionへの保存に失敗しました。通信状態を確認してください。");
     },
   });
-
-  // When a fresh result is shown and no destination is cached yet, look up
-  // the user's TED page (their chosen home for these results) once.
-  useEffect(() => {
-    if (
-      phase === "done" &&
-      result &&
-      !result.notion_page_url &&
-      destinations.length === 0 &&
-      !autoDestSearchRef.current
-    ) {
-      autoDestSearchRef.current = true;
-      searchDestMutation.mutate("TED");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, result, destinations.length]);
 
   async function saveResultToNotion() {
     if (!result) return;
@@ -566,8 +626,8 @@ export function App() {
     setWantNotion(false);
     setSelectedDest("");
     setDestQuery("");
+    setDestQueryError(null);
     setNotionMsg(null);
-    autoDestSearchRef.current = false;
   }
 
   function playModel() {
@@ -778,6 +838,7 @@ export function App() {
           </div>
           <textarea
             id="custom-sentence"
+            {...FIELDS.recordAttempt.target}
             value={customText}
             onChange={(e) => {
               setCustomText(e.target.value);
@@ -1032,6 +1093,11 @@ export function App() {
                             ))}
                             <option value="__draft__">指定しない（プライベートページ）</option>
                           </select>
+                          {destinations.length === 0 && !searchDestMutation.isPending && (
+                            <p className="mt-1 text-xs text-[var(--dim)]">
+                              保存先はまだ登録されていません。下の検索からページを追加してください。
+                            </p>
+                          )}
                           {searchDestMutation.isPending && (
                             <p className="mt-1 text-xs text-[var(--dim)]">保存先を検索中…</p>
                           )}
@@ -1039,36 +1105,54 @@ export function App() {
                             destinations.find((d) => d.pageId === effectiveDestId)?.isDefault !== true && (
                               <button
                                 type="button"
-                                onClick={() => setDefaultDestMutation.mutate(effectiveDestId)}
-                                disabled={setDefaultDestMutation.isPending}
-                                className="mt-1 text-xs font-medium text-[var(--accent)] underline disabled:opacity-40"
+                                onClick={() => setDefaultDestination(effectiveDestId)}
+                                className="mt-1 text-xs font-medium text-[var(--accent)] underline"
                                 aria-label="選択中の保存先を既定にする"
                               >
                                 この保存先を既定にする
                               </button>
                             )}
                         </div>
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            value={destQuery}
-                            onChange={(e) => setDestQuery(e.target.value)}
-                            placeholder="ページ名で検索（例: TED）"
-                            aria-label="Notionの保存先をページ名で検索"
-                            className="min-w-0 flex-1 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-base outline-none focus:border-[var(--accent)]"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const q = destQuery.trim();
-                              if (q) searchDestMutation.mutate(q);
-                            }}
-                            disabled={searchDestMutation.isPending || destQuery.trim() === ""}
-                            className="shrink-0 rounded-full border border-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--accent)] disabled:opacity-40"
-                            aria-label="保存先を検索"
-                          >
-                            検索
-                          </button>
+                        <div>
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              {...FIELDS.searchNotionPages.query}
+                              value={destQuery}
+                              onChange={(e) => {
+                                setDestQuery(e.target.value);
+                                setDestQueryError(null);
+                              }}
+                              placeholder="ページ名で検索"
+                              aria-label="Notionの保存先をページ名で検索"
+                              className="min-w-0 flex-1 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-base outline-none focus:border-[var(--accent)]"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const q = destQuery.trim();
+                                if (!q) {
+                                  setDestQueryError("検索するページ名を入力してください。");
+                                  return;
+                                }
+                                setDestQueryError(null);
+                                searchDestMutation.mutate(q);
+                              }}
+                              disabled={searchDestMutation.isPending}
+                              className="shrink-0 rounded-full border border-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--accent)] disabled:opacity-40"
+                              aria-label="保存先を検索"
+                            >
+                              検索
+                            </button>
+                          </div>
+                          {destQueryError && (
+                            <p role="alert" className="mt-1 text-xs text-[var(--ng-text)]">
+                              {destQueryError}
+                            </p>
+                          )}
+                          <p className="mt-1 text-xs text-[var(--dim)]">
+                            保存先のリストはこの端末のブラウザに保存されます（サーバーには保存されません）。
+                          </p>
                         </div>
                         <button
                           type="button"
