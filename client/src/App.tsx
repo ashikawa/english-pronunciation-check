@@ -3,6 +3,7 @@
 // The client is split by concern (see DATA-PLAN.md):
 //   lib/storage.ts        localStorage stores (destinations, texts, failure log)
 //   lib/speech.ts         Web Speech typings, constants, candidate builder
+//   lib/messages.ts       recognition error / diagnostic wording templates
 //   lib/sound-changes.ts  sound-change candidate detection (pure)
 //   lib/audio.ts          blob → base64
 //   hooks/useRecordingSession.ts   recording + recognition lifecycle (one file, whole)

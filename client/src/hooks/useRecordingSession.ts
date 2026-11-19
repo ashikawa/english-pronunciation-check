@@ -11,6 +11,21 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, type ApiResponse } from "../api";
 import {
+  emptyRecognitionError,
+  emptyRecognitionNote,
+  emptyRecognitionSummary,
+  earlyEndGiveUpDiag,
+  prevSessionTimeoutDiag,
+  prevSessionWaitingDiag,
+  PREV_SESSION_TIMEOUT_ERROR,
+  recognitionErrorDiag,
+  recognitionStartFailedDiag,
+  RECOGNITION_START_FAILED_ERROR,
+  restartFailedDiag,
+  restartLimitDiag,
+  settleTimeoutDiag,
+} from "../lib/messages";
+import {
   buildCandidateTranscripts,
   createSettledSignal,
   getRecognitionCtor,
@@ -435,7 +450,7 @@ export function useRecordingSession(options: RecordingSessionOptions) {
           recognitionErrorRef.current = event.error;
           // Keep the failure readable on screen, with the browser's
           // own error code, so it can be reported as-is.
-          setRecDiag(`音声認識エラー: ${event.error}`);
+          setRecDiag(recognitionErrorDiag(event.error));
           if (
             event.error === "not-allowed" ||
             event.error === "service-not-allowed" ||
@@ -495,9 +510,7 @@ export function useRecordingSession(options: RecordingSessionOptions) {
           if (earlyFailuresRef.current >= MAX_EARLY_FAILURES) {
             recognitionFatalRef.current = true;
             if (!recognitionErrorRef.current) recognitionErrorRef.current = "early-end";
-            setRecDiag(
-              `音声認識が開始直後に終了する状態が続いています（エラー: ${recognitionErrorRef.current}）。これ以上は自動で再試行しません。`,
-            );
+            setRecDiag(earlyEndGiveUpDiag(recognitionErrorRef.current));
             return;
           }
           restartTimerRef.current = window.setTimeout(() => {
@@ -511,7 +524,7 @@ export function useRecordingSession(options: RecordingSessionOptions) {
               if (!beginRecognition(Ctor, takeId)) {
                 recognitionFatalRef.current = true;
                 setRecDiag(
-                  `音声認識を再開できませんでした（${recognitionStartErrorRef.current ?? "start failed"}）。`,
+                  restartFailedDiag(recognitionStartErrorRef.current ?? "start failed"),
                 );
               }
             }
@@ -527,7 +540,7 @@ export function useRecordingSession(options: RecordingSessionOptions) {
           recognitionFatalRef.current = true;
           if (!recognitionErrorRef.current) recognitionErrorRef.current = "restart-limit";
           setRecDiag(
-            `音声認識セッションの再開が上限（${MAX_RECOGNITION_RESTARTS}回）に達したため、再開を停止しました（エラー: ${recognitionErrorRef.current}）。録音は続いていますが、この回はここまでしか認識されません。`,
+            restartLimitDiag(MAX_RECOGNITION_RESTARTS, recognitionErrorRef.current),
           );
           return;
         }
@@ -543,7 +556,7 @@ export function useRecordingSession(options: RecordingSessionOptions) {
             if (!beginRecognition(Ctor, takeId)) {
               recognitionFatalRef.current = true;
               setRecDiag(
-                `音声認識を再開できませんでした（${recognitionStartErrorRef.current ?? "start failed"}）。`,
+                restartFailedDiag(recognitionStartErrorRef.current ?? "start failed"),
               );
             }
           }
@@ -643,7 +656,7 @@ export function useRecordingSession(options: RecordingSessionOptions) {
           const waited = Date.now() - waitStartedAt;
           if (!announced && waited >= 1500) {
             announced = true;
-            setRecDiag("前の音声認識セッションの終了を待っています…（終了するまで録音を開始しません）");
+            setRecDiag(prevSessionWaitingDiag());
           }
           if (waited >= PREV_SESSION_WAIT_CAP_MS) break;
         }
@@ -653,9 +666,9 @@ export function useRecordingSession(options: RecordingSessionOptions) {
           takeStateRef.current = "none";
           setPhase("idle");
           setRecDiag(
-            `前の音声認識セッションが${Math.round(PREV_SESSION_WAIT_CAP_MS / 1000)}秒待っても終了しませんでした（終了待ちタイムアウト）。`,
+            prevSessionTimeoutDiag(Math.round(PREV_SESSION_WAIT_CAP_MS / 1000)),
           );
-          setError("前の音声認識セッションの終了待ちがタイムアウトしました。少し待ってから、もう一度録音してください。");
+          setError(PREV_SESSION_TIMEOUT_ERROR);
           return;
         }
         if (recognitionSettledRef.current === prevSignal) {
@@ -688,9 +701,9 @@ export function useRecordingSession(options: RecordingSessionOptions) {
         takeStateRef.current = "none";
         setPhase("idle");
         setRecDiag(
-          `音声認識の開始に失敗しました（${recognitionStartErrorRef.current ?? "start failed"}）。`,
+          recognitionStartFailedDiag(recognitionStartErrorRef.current ?? "start failed"),
         );
-        setError("音声認識を開始できませんでした。少し待ってから、もう一度録音してください。");
+        setError(RECOGNITION_START_FAILED_ERROR);
         return;
       }
     }
@@ -823,9 +836,7 @@ export function useRecordingSession(options: RecordingSessionOptions) {
         }
       } else {
         settleTimedOut = true;
-        setRecDiag(
-          "音声認識の終了待ちがタイムアウトしました（3秒）。最後の単語が認識結果に反映されていない可能性があります。",
-        );
+        setRecDiag(settleTimeoutDiag(3));
       }
     }
     const mimeType = recorderRef.current?.mimeType || "audio/webm";
@@ -866,35 +877,30 @@ export function useRecordingSession(options: RecordingSessionOptions) {
           ? Math.max(0, Math.round((Date.now() - takeStartedAtRef.current) / 1000))
           : null;
       const micPeak = micPeakRef.current;
-      const summary = `認識結果が空でした（録音時間: ${takeSecs !== null ? `約${takeSecs}秒` : "不明"} / 認識セッション開始: ${sessionCountRef.current}回 / 再起動: ${recognitionRestartsRef.current}回 / 開始直後の終了: ${earlyFailuresRef.current}回 / 結果イベント: ${anyResultRef.current ? "あり" : "なし"} / 確定した文: ${finalSegmentsRef.current.length}件 / マイク音量ピーク: ${micPeak !== null ? `約${Math.round(micPeak * 100)}%` : "計測できず"} / エラーコード: ${recognitionErrorRef.current ?? "なし"}${settleTimedOut ? " / 終了待ち: タイムアウト（3秒）" : ""}）`;
+      // The values above are all this hook computes. The wording of
+      // the summary, of its plain-language reading, and of the error
+      // message below is assembled in lib/messages.ts from the
+      // take's facts and error code.
+      const summary = emptyRecognitionSummary({
+        takeSecs,
+        sessionCount: sessionCountRef.current,
+        restarts: recognitionRestartsRef.current,
+        earlyFailures: earlyFailuresRef.current,
+        anyResult: anyResultRef.current,
+        finalSegmentCount: finalSegmentsRef.current.length,
+        micPeak,
+        errorCode: recognitionErrorRef.current,
+        settleTimedOut,
+      });
       setRecDiag(summary);
-      // A plain-language reading of the peak, shown inside the error
-      // frame together with the summary so the whole report is in
-      // one place. Worded as a possibility, not a verdict: the peak
-      // is measured on the recorder's stream, which is strong but
-      // not absolute evidence about the recognizer's own input.
-      const note =
-        micPeak === null
-          ? null
-          : micPeak < 0.03
-            ? "マイク音量ピークがほぼゼロでした。声がマイクに届いていなかった可能性があります（マイクの接続・選択・ミュートを確認してください）。"
-            : "マイクには声が届いていました。ブラウザ側の音声認識サービスが結果を返さなかった可能性が高いです。「認識をリセット（再読み込み）」を試してください。";
+      // The note is shown inside the error frame together with the
+      // summary so the whole report is in one place.
+      const note = emptyRecognitionNote(micPeak);
       setEmptyDiag({ summary, note });
       // Persist the failure so it survives the reload the reset
       // button performs, and can be reported verbatim afterwards.
       onFailureRef.current(summary);
-      const recError = recognitionErrorRef.current;
-      if (recError === "not-allowed" || recError === "service-not-allowed") {
-        setError("音声認識の使用が許可されませんでした。ブラウザの設定で音声認識（マイク）の許可を確認してください。");
-      } else if (recError === "audio-capture") {
-        setError("マイクから音声を取得できませんでした。マイクの接続を確認してもう一度お試しください。");
-      } else if (recError === "early-end") {
-        setError("音声認識が開始直後に終了してしまい、認識できませんでした。ネットワーク接続を確認してもう一度お試しください。");
-      } else if (recError === "network") {
-        setError("音声認識の通信に失敗しました。ネットワーク接続を確認してもう一度お試しください。");
-      } else {
-        setError("音声が認識できませんでした。静かな場所で、もう少し大きな声で読んでみてください。");
-      }
+      setError(emptyRecognitionError(recognitionErrorRef.current));
       setPhase("idle");
       return;
     }
