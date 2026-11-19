@@ -610,16 +610,6 @@ export function App() {
     [candidates],
   );
 
-  // After scoring, a candidate counts as "通じた可能性あり" when every word
-  // it spans was recognized. Only valid while the result's word list still
-  // aligns with the current text's tokens.
-  function candidateStatus(c: Candidate): "passed" | "check" | null {
-    if (!result || result.words.length !== tokens.length) return null;
-    return c.tokenIndexes.every((idx) => result.words[idx]?.status === "ok")
-      ? "passed"
-      : "check";
-  }
-
   function renderAnnotated(): ReactNode {
     const nodes: ReactNode[] = [];
     let cursor = 0;
@@ -851,12 +841,6 @@ export function App() {
     parentTitle: string | null;
     audioBase64: string | null;
     audioMimeType: string | null;
-    candidates: {
-      kindLabel: string;
-      phrase: string;
-      detail: string;
-      status: "passed" | "check" | null;
-    }[];
   };
 
   const saveNotionMutation = useMutation({
@@ -908,33 +892,11 @@ export function App() {
       parentTitle: dest ? dest.title : null,
       audioBase64,
       audioMimeType,
-      candidates: candidates.map((c) => ({
-        kindLabel: KIND_META[c.kind].label,
-        phrase: c.phrase,
-        detail: c.detail,
-        status: candidateStatus(c),
-      })),
     });
   }
 
   function saveHistoryToNotion(a: Attempt) {
     setHistoryNotionMsg(null);
-    const toks = parseTokens(a.target);
-    const cands = findCandidates(toks);
-    const payload = cands.map((c) => {
-      let status: "passed" | "check" | null = null;
-      if (a.words.length === toks.length) {
-        status = c.tokenIndexes.every((idx) => a.words[idx]?.status === "ok")
-          ? "passed"
-          : "check";
-      }
-      return {
-        kindLabel: KIND_META[c.kind].label,
-        phrase: c.phrase,
-        detail: c.detail,
-        status,
-      };
-    });
     const dest = destinations.find((d) => d.isDefault) ?? destinations[0];
     saveNotionMutation.mutate({
       attemptId: a.id,
@@ -942,7 +904,6 @@ export function App() {
       parentTitle: dest ? dest.title : null,
       audioBase64: null,
       audioMimeType: null,
-      candidates: payload,
     });
   }
 

@@ -54,16 +54,6 @@ export const NotionActions = {
       parentTitle: z.string().max(200).nullable(),
       audioBase64: z.string().max(30_000_000).nullable(),
       audioMimeType: z.string().max(100).nullable(),
-      candidates: z
-        .array(
-          z.object({
-            kindLabel: z.string().max(20),
-            phrase: z.string().max(200),
-            detail: z.string().max(200),
-            status: z.enum(["passed", "check"]).nullable(),
-          }),
-        )
-        .max(100),
     }),
     response: z.object({
       status: z.enum(["saved", "already_saved", "error"]),
@@ -119,16 +109,6 @@ export const NotionActions = {
         lines.push("- 要確認の単語: なし（全単語が認識されました）");
       }
       if (attempt.feedback) lines.push(`- フィードバック: ${flat(attempt.feedback)}`);
-      if (args.candidates.length > 0) {
-        lines.push("", "## 音の変化の候補（綴りからの推定）", "");
-        for (const c of args.candidates) {
-          const mark =
-            c.status === "passed" ? "通じた可能性あり" : c.status === "check" ? "要確認" : "";
-          lines.push(
-            `- ${c.kindLabel}: ${flat(c.phrase)} — ${flat(c.detail)}${mark ? `（${mark}）` : ""}`,
-          );
-        }
-      }
       const content = lines.join("\n");
 
       const mime = (args.audioMimeType ?? "").split(";")[0]?.trim() ?? "";
