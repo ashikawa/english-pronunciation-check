@@ -264,7 +264,8 @@ function createSettledSignal(): { promise: Promise<void>; resolve: () => void } 
 
 /** Upper bound on mid-take recognition restarts, so a recognizer that
  *  ends immediately every time cannot spin in a restart loop. Any
- *  result resets the budget. */
+ *  result resets the budget. Reaching the cap gives up on recognition
+ *  for the take, but never silently: the reason is left on screen. */
 const MAX_RECOGNITION_RESTARTS = 30;
 
 /** A recognition session that ends within this window of starting,
@@ -1099,11 +1100,16 @@ export function App() {
    * Start one recognition session for the current take and wire its
    * handlers. Returns false when the session could not be started.
    *
-   * A session can end on its own mid-take (a long pause, a transient
-   * network drop): `onend` then restarts it while the take is still
-   * recording, so the rest of the take is still heard — the accumulated
-   * transcript lives in refs outside the session, so a restart loses
-   * nothing. Fatal errors (permission, mic capture) are not restarted.
+   * A session can end on its own mid-take (a long pause, a sentence
+   * boundary, a transient network drop): `onend` then restarts it
+   * while the take is still recording, so the rest of the take is
+   * still heard — the accumulated transcript lives in refs outside
+   * the session, so a restart loses nothing. The guarantee `onend`
+   * implements is that EVERY mid-take session end is accounted for:
+   * it either schedules a restart, or recognition is marked fatal
+   * with the reason left on screen (fatal errors such as permission
+   * or mic capture, repeated failed starts, an exhausted restart
+   * budget). No end path leaves the take silently unrecognized.
    * The take's settled signal resolves only once recognition has been
    * asked to stop AND the last session has ended, which is what the
    * scoring path waits for.
@@ -1203,23 +1209,49 @@ export function App() {
       };
       rec.onend = () => {
         if (recognitionRef.current === rec) recognitionRef.current = null;
+        if (!recognitionActiveRef.current) {
+          // Recognition was asked to stop (停止 / キャンセル). Resolve
+          // only THIS take's signal (captured when the session
+          // started), never whatever signal the ref holds by now: a
+          // newer take may already have installed its own.
+          settledSignal?.resolve();
+          return;
+        }
+        // From here on the take still wants recognition, so this
+        // session end must lead somewhere visible: a scheduled
+        // restart, or — when restarting cannot help — recognition
+        // marked fatal with the reason left on screen. A session end
+        // that does neither is how a take loses its second half
+        // silently: the recognizer stops at a pause or a sentence
+        // boundary (the browser service ends sessions there, not
+        // only at a length limit) and nothing ever starts it again,
+        // while the recorder keeps running and the user keeps
+        // reading. The branches below are ordered so every end is
+        // accounted for.
         const inTake =
-          takeStateRef.current === "recording" || takeStateRef.current === "starting";
+          (takeStateRef.current === "recording" || takeStateRef.current === "starting") &&
+          takeIdRef.current === takeId;
+        if (!inTake) {
+          // This take is already being torn down by another path;
+          // that path owns what happens next.
+          return;
+        }
+        if (recognitionFatalRef.current) {
+          // A fatal error (permission, mic capture, a failed restart,
+          // an earlier give-up) already left its reason on screen;
+          // restarting cannot fix it, so the session stays ended.
+          // The settled signal is NOT resolved here: the take is
+          // still active, and the stop path releases the wait when
+          // the user ends the take.
+          return;
+        }
         // Failed start: this session died immediately, without a
         // single result, while the take still wants recognition.
-        // Retry a few times; past the cap, stop looping silently —
-        // mark recognition fatal for this take and leave the reason
-        // (with the error code) on screen. The settled signal is NOT
-        // resolved here: the take is still active, and the stop path
-        // releases the wait when the user ends the take.
+        // Retry a few times; past the cap, stop looping — mark
+        // recognition fatal for this take and leave the reason (with
+        // the error code) on screen.
         const diedEarly = !hadResult && Date.now() - startedAt < EARLY_END_MS;
-        if (
-          diedEarly &&
-          recognitionActiveRef.current &&
-          !recognitionFatalRef.current &&
-          inTake &&
-          takeIdRef.current === takeId
-        ) {
+        if (diedEarly) {
           earlyFailuresRef.current += 1;
           if (earlyFailuresRef.current >= MAX_EARLY_FAILURES) {
             recognitionFatalRef.current = true;
@@ -1247,35 +1279,36 @@ export function App() {
           }, 800);
           return;
         }
-        const shouldRestart =
-          recognitionActiveRef.current &&
-          !recognitionFatalRef.current &&
-          takeStateRef.current === "recording" &&
-          takeIdRef.current === takeId &&
-          recognitionRestartsRef.current < MAX_RECOGNITION_RESTARTS;
-        if (shouldRestart) {
-          recognitionRestartsRef.current += 1;
-          restartTimerRef.current = window.setTimeout(() => {
-            restartTimerRef.current = null;
-            if (
-              recognitionActiveRef.current &&
-              takeStateRef.current === "recording" &&
-              takeIdRef.current === takeId
-            ) {
-              if (!beginRecognition(Ctor, takeId)) {
-                recognitionFatalRef.current = true;
-                setRecDiag(
-                  `音声認識を再開できませんでした（${recognitionStartErrorRef.current ?? "start failed"}）。`,
-                );
-              }
-            }
-          }, 300);
-        } else if (!recognitionActiveRef.current) {
-          // Resolve only THIS take's signal (captured when the session
-          // started), never whatever signal the ref holds by now: a
-          // newer take may already have installed its own.
-          settledSignal?.resolve();
+        if (recognitionRestartsRef.current >= MAX_RECOGNITION_RESTARTS) {
+          // The restart budget is spent. Any result resets it, so
+          // reaching the cap means many sessions in a row ended
+          // without hearing anything. Give up — but say so on screen
+          // instead of leaving the rest of the take unrecognized
+          // with no explanation.
+          recognitionFatalRef.current = true;
+          if (!recognitionErrorRef.current) recognitionErrorRef.current = "restart-limit";
+          setRecDiag(
+            `音声認識セッションの再開が上限（${MAX_RECOGNITION_RESTARTS}回）に達したため、再開を停止しました（エラー: ${recognitionErrorRef.current}）。録音は続いていますが、この回はここまでしか認識されません。`,
+          );
+          return;
         }
+        recognitionRestartsRef.current += 1;
+        restartTimerRef.current = window.setTimeout(() => {
+          restartTimerRef.current = null;
+          if (
+            recognitionActiveRef.current &&
+            !recognitionFatalRef.current &&
+            (takeStateRef.current === "recording" || takeStateRef.current === "starting") &&
+            takeIdRef.current === takeId
+          ) {
+            if (!beginRecognition(Ctor, takeId)) {
+              recognitionFatalRef.current = true;
+              setRecDiag(
+                `音声認識を再開できませんでした（${recognitionStartErrorRef.current ?? "start failed"}）。`,
+              );
+            }
+          }
+        }, 300);
       };
       rec.start();
     } catch (e) {
