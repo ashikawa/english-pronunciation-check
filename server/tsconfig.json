@@ -10,5 +10,5 @@
       "@space/privileged": ["./.generated/privileged.contract"]
     }
   },
-  "include": ["src/**/*", ".generated/**/*"]
+  "include": ["src/**/*", "tests/**/*", ".generated/**/*"]
 }

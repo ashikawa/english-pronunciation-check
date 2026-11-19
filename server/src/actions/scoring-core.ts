@@ -1,7 +1,8 @@
 // Pure scoring core: tokenization, word alignment, and best-candidate
 // selection. No I/O, no SDK, no database — everything here is a
 // deterministic function of its inputs, which is exactly what makes it
-// unit-testable (see scoring-core.test.ts). `scoring.ts` wraps these
+// unit-testable (see server/tests/actions/scoring-core.test.ts).
+// `scoring.ts` wraps these
 // functions with the action handler (feedback generation + storage).
 
 import type { WordResult } from "./shared";
