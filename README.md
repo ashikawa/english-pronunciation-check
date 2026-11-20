@@ -4,8 +4,12 @@
 
 ## 音声認識について
 
-- 文字起こしはブラウザ標準の Web Speech API を使用。実装は `client/src/App.tsx`（`getRecognitionCtor`、`startRecording` 内の `rec.onresult`、`handleRecorderStop`）
+- 文字起こしはブラウザ標準の Web Speech API を使用。実装は `client/src/hooks/useRecordingSession.ts`（認識セッションの管理）と `client/src/lib/speech.ts`（型と候補整形）
 - サーバー側は文字起こしをせず、文字列を受け取って単語照合と採点のみ行う
 - 認識モデルはブラウザ依存のため、精度はアプリ側で制御できない。使うブラウザで結果が変わる
 - 録音データは再生とNotion保存用で、文字起こしには使わない
 - 精度や音素レベルの評価を制御したい場合は、外部の音声認識／発音評価APIへ音声を送る方式への変更が必要。その場合、音声が端末の外に出て、APIキーと費用が必要になる
+
+## 既知の制限
+
+文字起こしはブラウザの Web Speech API に依存しているため、長文（30秒〜）の録音では、認識文が途中で欠落したり、まれに重複したりする場合がある。これは API 側のセッション挙動によるもので、アプリ側では完全には防げない。観測された問題と根拠の詳細は [docs/recognition-behavior.md](docs/recognition-behavior.md) に記録している。録音前にページを再読み込みすると、初回テイクの成功率が上がる。
